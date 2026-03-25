@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Z_O_Integration_User.py
-# Fill in the CONFIGURATION block below, then follow ZO_Claude_Setup_Instructions.md
+# Fill in the CONFIGURATION block below.
 """
 Zotero → Obsidian Pipeline
 ---------------------------
@@ -48,7 +48,11 @@ DEFAULT_CONCEPTS_DIR = ""  # kept for CLI compat — not required
 DEFAULT_VAULT_DIR    = ""  # e.g. "/Users/yourname/Library/Mobile Documents/iCloud~md~obsidian/Documents/MyVault"
 # ─────────────────────────────────────────────
 
-# ── Auto-derived paths (leave SNAPSHOT_FILE and TO_ORGANIZE_DIR blank above) ──
+SNAPSHOT_FILE   = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
+TO_ORGANIZE_DIR = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
+PHD_COLLECTION  = ""  # exact name of your root Zotero collection, e.g. "My Research"
+
+# ── Auto-derived paths ────────────────────────────────────────────────────────
 if DEFAULT_VAULT_DIR:
     if not SNAPSHOT_FILE:
         SNAPSHOT_FILE = str(Path(DEFAULT_VAULT_DIR) / ".zotero_sync_state.json")
@@ -58,12 +62,9 @@ if DEFAULT_VAULT_DIR:
 
 ZOTERO_START    = "<!-- zotero-start -->"
 CONCEPT_T_START = "<!-- zotero-auto-start -->"
-THOUGHTS_DIR    = "To_Organize/Thoughts and Directions.md"  # single file for all purple annotations
 CONCEPT_T_END   = "<!-- zotero-auto-end -->"
-SNAPSHOT_FILE  = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
-PHD_COLLECTION = ""  # exact name of your root Zotero collection, e.g. "My Research"
+THOUGHTS_DIR    = "To_Organize/Thoughts and Directions.md"
 ZOTERO_END      = "<!-- zotero-end -->"
-TO_ORGANIZE_DIR = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
 
 
 # ── Parsing ───────────────────────────────────────────────────────────────────
@@ -153,7 +154,7 @@ def extract_manual_links(source_file: Path, content: str = None) -> list:
     if not source_file.exists():
         return []
 
-    file_content = content if content is not None else source_file.read_text(encoding='utf-8')
+    file_content = content if content is not None else source_file.read_text(encoding='utf-8', errors='replace')
     results = []
 
     # Split into segments: each annotation block + the text after it
@@ -182,7 +183,7 @@ def extract_manual_section(source_file: Path, content: str = None) -> tuple:
     if not source_file.exists():
         return "", ""
 
-    content = content if content is not None else source_file.read_text(encoding='utf-8')
+    content = content if content is not None else source_file.read_text(encoding='utf-8', errors='replace')
 
     # Match both the generic marker and keyed markers (<!-- zotero-start-ANNKEY -->)
     first_start = _RE_FIRST_MARKER.search(content)
@@ -440,7 +441,7 @@ def yaml_str(value: str) -> str:
 def safe_filename(title: str) -> str:
     if not title:
         return "Untitled"
-    safe = re.sub(r'[\\/*?:"<>|\']', '', title).strip('. ')
+    safe = re.sub(r'[\\/*?:"<>|\'\[\]]', '', title).strip('. ')
     safe = safe.replace('\u2019', '').replace('\u2018', '')
     return safe[:120]
 
@@ -591,7 +592,7 @@ def extract_inter_annotation_notes(source_file: Path, content: str = None) -> di
         print(f"  ⚠️  Skipping oversized file: {source_file.name}")
         return {}
 
-    text = content if content is not None else source_file.read_text(encoding='utf-8')
+    text = content if content is not None else source_file.read_text(encoding='utf-8', errors='replace')
     result = {}
 
     for match in _RE_INTER_ANN.finditer(text):
@@ -948,7 +949,7 @@ def write_all_target_notes(all_entries: dict, active_filenames: set = None):
         )
 
         if target_path.exists():
-            existing = target_path.read_text(encoding='utf-8')
+            existing = target_path.read_text(encoding='utf-8', errors='replace')
             if T_START in existing and T_END in existing:
                 start = existing.find(T_START)
                 end = existing.find(T_END) + len(T_END)
@@ -1104,8 +1105,19 @@ def resolve_link(link_target: str, vault_index: dict,
     3. Otherwise — return To_Organize/link_target.md
     """
     link_target = link_target.strip()
+    # Guard against directory traversal attempts
+    if '..' in link_target:
+        safe_name = re.sub(r'[\/*?:"<>|]', '', link_target).strip()
+        return to_organize_path / (safe_name + ".md")
     if '/' in link_target:
-        return vault_path / (link_target + ".md")
+        resolved = vault_path / (link_target + ".md")
+        # Ensure resolved path stays within vault
+        try:
+            resolved.relative_to(vault_path)
+        except ValueError:
+            safe_name = re.sub(r'[\/*?:"<>|]', '', link_target.replace('/', '_')).strip()
+            return to_organize_path / (safe_name + ".md")
+        return resolved
 
     # Normalize: lowercase + replace smart quotes with straight apostrophe
     def _normalize(s):
@@ -1140,7 +1152,7 @@ def cleanup_stale_to_organize(vault_path: Path, to_organize_path: Path, vault_in
         if key in vault_index and vault_index[key] != md_file:
             # A file with this name exists elsewhere — this To_Organize copy is stale
             # Only remove if it has no manual content outside the auto-block
-            content = md_file.read_text(encoding='utf-8')
+            content = md_file.read_text(encoding='utf-8', errors='replace')
             T_START = CONCEPT_T_START
             T_END = CONCEPT_T_END
             if T_START in content and T_END in content:
@@ -1262,6 +1274,8 @@ def run(zotero_db: str, sources_dir: str, concepts_dir: str,
             os.kill(pid, 0)  # Signal 0 = just check if process exists
             print("⚠️  Another sync is already running. Skipping.")
             return
+        except FileNotFoundError:
+            pass  # lock file disappeared between exists() and read — harmless
         except (ProcessLookupError, ValueError, OSError):
             lock_file.unlink(missing_ok=True)  # Stale lock — remove it
     lock_file.write_text(str(os.getpid()))
@@ -1339,7 +1353,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         for sd in source_dirs:
             candidate = sd / filename
             if candidate.exists():
-                content = candidate.read_text(encoding='utf-8')
+                content = candidate.read_text(encoding='utf-8', errors='replace')
                 if content.strip():
                     source_content = content
                     source_file_used = candidate
