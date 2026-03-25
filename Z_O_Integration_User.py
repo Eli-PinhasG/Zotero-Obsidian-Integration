@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Z_O_Integration_User.py
-# Fill in the CONFIGURATION block below, then follow ZO_Claude_Setup_Instructions.md
+# Fill in the CONFIGURATION block below.
 """
 Zotero → Obsidian Pipeline
 ---------------------------
