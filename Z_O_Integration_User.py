@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Z_O_Integration_User.py
-# Fill in the CONFIGURATION block below.
+# Fill in the CONFIGURATION block below, then follow ZO_Claude_Setup_Instructions.md
 """
 Zotero → Obsidian Pipeline
 ---------------------------
@@ -988,6 +988,12 @@ def write_all_target_notes(all_entries: dict, active_filenames: set = None):
         if len(full_content.encode('utf-8')) > 500_000:
             print(f"  ⚠️  Concept file too large, skipping: {target_path.name}")
             continue
+        # Skip write if content hasn't changed — avoids unnecessary iCloud uploads
+        if target_path.exists():
+            existing_hash = hashlib.md5(target_path.read_bytes()).hexdigest()
+            new_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+            if existing_hash == new_hash:
+                continue
         try:
             target_path.write_text(full_content, encoding='utf-8')
             print(f"  [→] {target_path.relative_to(target_path.parent.parent)} ({len(data['entries'])} source(s))")
@@ -1445,7 +1451,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         active_filenames = {safe_filename(p.get('title', 'Untitled')) + ".md" for p in papers.values()}
         write_all_target_notes(all_entries, active_filenames)
         # Clean up To_Organize files that now have a proper home in Concepts etc.
-        cleanup_stale_to_organize(vault_path, to_organize_path, build_vault_index(vault_path, sources_dir))
+        cleanup_stale_to_organize(vault_path, to_organize_path, vault_index)
 
     # ── Save updated snapshot ─────────────────────────────────────────────────
     if not dry_run:
