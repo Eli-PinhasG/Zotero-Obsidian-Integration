@@ -14,7 +14,7 @@ Designed for long-term academic work (PhD dissertations, books, etc.) to maximiz
   - **Purple**: Interpretive thoughts → automatically collected in `Thoughts and Directions.md`
   - **Grey**: “Already used/cited” → collapsible `> [!check]` callout with `(p. X)` parsing
   - **Sticky notes**: Clean `> [!note]` callouts (first one auto-titled “Overview”)
-- Bidirectional [[link]] harvesting — tag `[[Concept]]` or `[[Chapter X]]` anywhere in a source note
+- Bidirectional [[link]] harvesting — tags anywhere in a source note
 - Automatically mirrors your Zotero collection hierarchy under the `Sources/` folder
 - Pure Markdown output (no HTML) — clean, theme-friendly, and future-proof
 - Deep Zotero links on every annotation and paper title
