@@ -62,15 +62,15 @@ def _norm_key(s: str) -> str:
 # CONFIGURATION — set your paths here
 # ─────────────────────────────────────────────
 DEFAULT_ZOTERO_DB    = str(Path.home() / "Zotero" / "zotero.sqlite")
-DEFAULT_SOURCES_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources"
+DEFAULT_SOURCES_DIR  = ""
 DEFAULT_CONCEPTS_DIR = ""  # kept for CLI compat — not required
 # The root of your vault — used to resolve [[Folder/Note]] links
-DEFAULT_VAULT_DIR    = ""  # e.g. "/Users/yourname/.../MyVault"
+DEFAULT_VAULT_DIR    = ""
 # ─────────────────────────────────────────────
 
-SNAPSHOT_FILE   = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
-TO_ORGANIZE_DIR = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
-PHD_COLLECTION  = ""  # exact name of your root Zotero collection
+SNAPSHOT_FILE   = ""
+TO_ORGANIZE_DIR = ""
+PHD_COLLECTION  = ""
 
 # ── Auto-derived paths ────────────────────────────────────────────────────────
 if DEFAULT_VAULT_DIR:
@@ -258,10 +258,14 @@ def get_zotero_data(db_path: str):
         print(f"[ERROR] Zotero database not found at: {db_path}")
         sys.exit(1)
 
-    # Open in read-only mode via URI. mode=ro prevents writes.
-    # immutable=1 removed: SQLite docs warn it can return incorrect results
-    # if the DB changes during read — Zotero may write while we read.
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    # Copy DB to /tmp first, then open the copy.
+    # This avoids "database is locked" when Zotero is open and writing,
+    # and is safer than immutable=1 (which skips locking and can return
+    # corrupt results if the DB changes mid-read).
+    import shutil
+    tmp_db = "/tmp/zotero_readonly_copy.sqlite"
+    shutil.copy2(db_path, tmp_db)
+    conn = sqlite3.connect(f"file:{tmp_db}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
@@ -439,6 +443,10 @@ def get_zotero_data(db_path: str):
                 papers[paper_id]['att_key'] = ak
 
     conn.close()
+    try:
+        os.unlink(tmp_db)
+    except OSError:
+        pass
 
     total_anns = sum(len(p.get('annotations', [])) for p in papers.values())
     print(f"   Found {len(papers)} papers total, {total_anns} annotations total.")
