@@ -22,6 +22,7 @@ import os
 import sys
 import argparse
 import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -39,6 +40,7 @@ _RE_YEAR             = re.compile(r'\d{4}')
 _RE_PAGE_META        = re.compile(r'\*.*p\..*\*')
 _RE_TASK_LINE        = re.compile(r'^- \[[ x]\]\s*$')
 _RE_FIRST_MARKER     = re.compile(r'<!-- zotero-start[^>]*-->')
+_RE_PAPER_MARKER     = re.compile(r'^\[paper:\s*(.+?)\s*\]$', re.IGNORECASE)
 def _extract_year(pub_date: str) -> str:
     """Extract 4-digit year from a date string, or return empty string."""
     if not pub_date:
@@ -62,15 +64,15 @@ def _norm_key(s: str) -> str:
 # CONFIGURATION — set your paths here
 # ─────────────────────────────────────────────
 DEFAULT_ZOTERO_DB    = str(Path.home() / "Zotero" / "zotero.sqlite")
-DEFAULT_SOURCES_DIR  = ""
+DEFAULT_SOURCES_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources"
 DEFAULT_CONCEPTS_DIR = ""  # kept for CLI compat — not required
 # The root of your vault — used to resolve [[Folder/Note]] links
-DEFAULT_VAULT_DIR    = ""
+DEFAULT_VAULT_DIR    = ""  # e.g. "/Users/yourname/.../MyVault"
 # ─────────────────────────────────────────────
 
-SNAPSHOT_FILE   = ""
-TO_ORGANIZE_DIR = ""
-PHD_COLLECTION  = ""
+SNAPSHOT_FILE   = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
+TO_ORGANIZE_DIR = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
+PHD_COLLECTION  = ""  # exact name of your root Zotero collection
 
 # ── Auto-derived paths ────────────────────────────────────────────────────────
 if DEFAULT_VAULT_DIR:
@@ -262,7 +264,6 @@ def get_zotero_data(db_path: str):
     # This avoids "database is locked" when Zotero is open and writing,
     # and is safer than immutable=1 (which skips locking and can return
     # corrupt results if the DB changes mid-read).
-    import shutil
     tmp_db = "/tmp/zotero_readonly_copy.sqlite"
     shutil.copy2(db_path, tmp_db)
     conn = sqlite3.connect(f"file:{tmp_db}?mode=ro&immutable=1", uri=True)
@@ -274,7 +275,9 @@ def get_zotero_data(db_path: str):
             idv_title.value AS title, idv_date.value AS pub_date,
             idv_doi.value AS doi, idv_url.value AS url,
             idv_abstract.value AS abstract, idv_journal.value AS journal,
-            it.typeName AS item_type
+            it.typeName AS item_type,
+            idv_booktitle.value AS book_title,
+            idv_pages.value AS pages
         FROM items i
         JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
         LEFT JOIN itemData id_title ON i.itemID = id_title.itemID
@@ -295,25 +298,39 @@ def get_zotero_data(db_path: str):
         LEFT JOIN itemData id_journal ON i.itemID = id_journal.itemID
             AND id_journal.fieldID = (SELECT fieldID FROM fields WHERE fieldName='publicationTitle')
         LEFT JOIN itemDataValues idv_journal ON id_journal.valueID = idv_journal.valueID
+        LEFT JOIN itemData id_booktitle ON i.itemID = id_booktitle.itemID
+            AND id_booktitle.fieldID = (SELECT fieldID FROM fields WHERE fieldName='bookTitle')
+        LEFT JOIN itemDataValues idv_booktitle ON id_booktitle.valueID = idv_booktitle.valueID
+        LEFT JOIN itemData id_pages ON i.itemID = id_pages.itemID
+            AND id_pages.fieldID = (SELECT fieldID FROM fields WHERE fieldName='pages')
+        LEFT JOIN itemDataValues idv_pages ON id_pages.valueID = idv_pages.valueID
         WHERE it.typeName NOT IN ('attachment','note','annotation')
         AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
     """)
     papers = {row['itemID']: dict(row) for row in cur.fetchall()}
 
     cur.execute("""
-        SELECT ia.itemID, c.firstName, c.lastName
+        SELECT ia.itemID, c.firstName, c.lastName, ct.creatorType
         FROM itemCreators ia
         JOIN creators c ON ia.creatorID = c.creatorID
         JOIN creatorTypes ct ON ia.creatorTypeID = ct.creatorTypeID
-        WHERE ct.creatorType = 'author'
+        WHERE ct.creatorType IN ('author', 'editor', 'bookAuthor', 'seriesEditor')
         ORDER BY ia.itemID, ia.orderIndex
     """)
+    # creatorType routing:
+    #   author / bookAuthor → authors list (chapter or primary book author)
+    #   editor / seriesEditor → editors list (volume or series editor)
+    _AUTHOR_TYPES = {'author', 'bookAuthor'}
     for row in cur.fetchall():
         iid = row['itemID']
         if iid in papers:
-            papers[iid].setdefault('authors', [])
             name = f"{row['firstName']} {row['lastName']}".strip()
-            papers[iid]['authors'].append(name)
+            if row['creatorType'] in _AUTHOR_TYPES:
+                papers[iid].setdefault('authors', [])
+                papers[iid]['authors'].append(name)
+            else:
+                papers[iid].setdefault('editors', [])
+                papers[iid]['editors'].append(name)
 
     cur.execute("""
         SELECT ia.itemID AS ann_id, i.key AS ann_key,
@@ -507,6 +524,21 @@ def format_authors(authors: list) -> str:
     if len(authors) == 2:
         return " & ".join(authors)
     return f"{authors[0]} et al."
+
+
+def format_creators(paper: dict) -> str:
+    """Return a formatted author/editor string for display.
+    Falls back to editors (with role label) when no authors are present,
+    which is the normal case for edited volumes stored as book items.
+    """
+    authors = paper.get('authors', [])
+    if authors:
+        return format_authors(authors)
+    editors = paper.get('editors', [])
+    if editors:
+        suffix = ' (ed.)' if len(editors) == 1 else ' (eds.)'
+        return format_authors(editors) + suffix
+    return 'Unknown Author'
 
 
 def zotero_link(ann: dict, att_key: str) -> str:
@@ -738,14 +770,19 @@ def build_zotero_block(paper: dict, inter_notes: dict = None) -> str:
 def build_source_note(paper: dict, before: str, after: str,
                       inter_notes: dict = None) -> str:
     """Build the full source note, preserving manual content outside the Zotero block."""
-    title    = paper.get('title', 'Untitled')
-    authors  = format_authors(paper.get('authors', []))
-    pub_date = paper.get('pub_date', '')
-    journal  = paper.get('journal', '')
-    doi      = paper.get('doi', '')
-    url      = paper.get('url', '')
-    abstract = paper.get('abstract', '')
-    zot_key  = paper.get('key', '')
+    item_type    = paper.get('item_type', '')
+    book_title   = paper.get('book_title', '') if item_type == 'bookSection' else ''
+    pages        = paper.get('pages', '')      if item_type == 'bookSection' else ''
+    # Null-safe title: bookSections may have no paper title set in Zotero
+    title        = paper.get('title') or book_title or 'Untitled'
+    authors_list = paper.get('authors', [])
+    editors_list = paper.get('editors', [])
+    pub_date     = paper.get('pub_date', '')
+    journal      = paper.get('journal', '')
+    doi          = paper.get('doi', '')
+    url          = paper.get('url', '')
+    abstract     = paper.get('abstract', '')
+    zot_key      = paper.get('key', '')
 
     year = _extract_year(pub_date)
 
@@ -756,10 +793,19 @@ def build_source_note(paper: dict, before: str, after: str,
         if m:
             created_date = m.group(1)
 
+    # ── YAML frontmatter ──────────────────────────────────────────────────────
     header_lines = ["---"]
-    header_lines.append(f'authors: "{yaml_str(authors)}"')
+    # Use correct role key — never write "Unknown Author" for an editors-only item
+    if authors_list:
+        header_lines.append(f'authors: "{yaml_str(format_authors(authors_list))}"')
+    elif editors_list:
+        header_lines.append(f'editors: "{yaml_str(format_authors(editors_list))}"')
     if year:
         header_lines.append(f'year: {year}')
+    if book_title:
+        header_lines.append(f'from: "{yaml_str(book_title)}"')
+        if pages:
+            header_lines.append(f'pages: "{yaml_str(pages)}"')
     if journal:
         header_lines.append(f'journal: "{yaml_str(journal)}"')
     if doi:
@@ -771,6 +817,11 @@ def build_source_note(paper: dict, before: str, after: str,
     header_lines.append("zotero_sync_managed: true")
     header_lines.append("---")
     header_lines.append("")
+
+    # ── Body ─────────────────────────────────────────────────────────────────
+    # No # Title heading — relies on Obsidian inline title (filename) to avoid
+    # visual duplication. The Zotero open link is attached to the creator line
+    # instead (for bookSection items it is already in the "In:" line below).
     att_key_paper = paper.get('att_key', '')
     if att_key_paper:
         zotero_item_link = f"[→](zotero://open-pdf/library/items/{att_key_paper})"
@@ -778,11 +829,44 @@ def build_source_note(paper: dict, before: str, after: str,
         zotero_item_link = f"[→](zotero://select/library/items/{zot_key})"
     else:
         zotero_item_link = ""
-    header_lines.append(f"# {title} {zotero_item_link}".strip())
-    header_lines.append("")
-    header_lines.append(f"**Authors:** {authors}")
+
+    # Creator display line — label reflects actual role
+    if authors_list:
+        creator_label   = "Authors"
+        creator_display = format_authors(authors_list)
+    elif editors_list:
+        creator_label   = "Editors"
+        creator_display = format_authors(editors_list)
+    else:
+        creator_label   = "Authors"
+        creator_display = "Unknown"
+
+    # Attach the Zotero link to the creator line for non-bookSection items;
+    # bookSection items get their link in the "In:" line below.
+    if zotero_item_link and not book_title:
+        header_lines.append(f"**{creator_label}:** {creator_display} {zotero_item_link}")
+    else:
+        header_lines.append(f"**{creator_label}:** {creator_display}")
+
     if year:
         header_lines.append(f"**Year:** {year}")
+    # For bookSection: show collection context + page range with link to book
+    if book_title:
+        if att_key_paper and pages:
+            start_page = pages.split('–')[0].split('-')[0].strip()
+            book_link = f"[→](zotero://open-pdf/library/items/{att_key_paper}?page={start_page})"
+        elif att_key_paper:
+            book_link = f"[→](zotero://open-pdf/library/items/{att_key_paper})"
+        elif zot_key:
+            book_link = f"[→](zotero://select/library/items/{zot_key})"
+        else:
+            book_link = ""
+        collection_ref = f"*{book_title}*"
+        if pages:
+            collection_ref += f", pp. {pages}"
+        if book_link:
+            collection_ref += f" {book_link}"
+        header_lines.append(f"**In:** {collection_ref}")
     if journal:
         header_lines.append(f"**Journal:** {journal}")
     if doi:
@@ -815,9 +899,19 @@ def build_concept_entry_from_zotero(paper_filename: str, annotations: list,
     lines.append(f"### From [[{paper_filename.replace('.md','')}]]")
 
     if paper:
-        authors = format_authors(paper.get('authors', []))
+        authors = format_creators(paper)
         pub_date = paper.get('pub_date', '')
         year = _extract_year(pub_date)
+        item_type  = paper.get('item_type', '')
+        book_title = paper.get('book_title', '') if item_type == 'bookSection' else ''
+        pages      = paper.get('pages', '')      if item_type == 'bookSection' else ''
+        if book_title:
+            # Show collection context subtly (paper is in an edited volume)
+            collection_line = f"*in {book_title}"
+            if pages:
+                collection_line += f", pp. {pages}"
+            collection_line += "*"
+            lines.append(collection_line)
         if authors or year:
             attribution = ', '.join(p for p in [authors, year] if p)
             lines.append(f"*{attribution}*")
@@ -951,9 +1045,12 @@ def build_concept_entry_from_manual(paper_filename: str, contexts: list) -> str:
 
 def collect_concept_entry(all_entries: dict, concept_path: Path,
                            paper_filename: str, entry_text: str,
-                           first_ann_date: str = ""):
+                           first_ann_date: str = "", book_title: str = ""):
     """Add an entry to be written to a concept/target note.
-    Merges multiple entries from the same source into one block."""
+    Merges multiple entries from the same source into one block.
+    book_title is non-empty only for Case B virtual-paper entries; it is used
+    to insert a '## Edited Book: …' heading before that group in the note.
+    """
     key = str(concept_path)
     if key not in all_entries:
         all_entries[key] = {
@@ -961,7 +1058,7 @@ def collect_concept_entry(all_entries: dict, concept_path: Path,
             'path': concept_path,
             'entries': []
         }
-    for i, (fname, etext, edate) in enumerate(all_entries[key]['entries']):
+    for i, (fname, etext, edate, ebt) in enumerate(all_entries[key]['entries']):
         if fname == paper_filename:
             lines = entry_text.split('\n')
             bullet_lines = []
@@ -976,25 +1073,43 @@ def collect_concept_entry(all_entries: dict, concept_path: Path,
             merged = etext.rstrip() + '\n' + '\n'.join(bullet_lines)
             all_entries[key]['entries'][i] = (
                 fname, merged,
-                min(edate, first_ann_date) if edate and first_ann_date else edate or first_ann_date
+                min(edate, first_ann_date) if edate and first_ann_date else edate or first_ann_date,
+                ebt or book_title,
             )
             return
-    all_entries[key]['entries'].append((paper_filename, entry_text, first_ann_date))
+    all_entries[key]['entries'].append((paper_filename, entry_text, first_ann_date, book_title))
 
 
-def _strip_dead_entries(block: str, active_filenames: set) -> str:
-    """Remove ### From [[Paper]] blocks for papers no longer in the active library."""
-    sections = re.split(r'(?=### From \[\[)', block)
-    kept = []
-    for sec in sections:
-        m = re.match(r'### From \[\[([^\]]+)\]\]', sec.strip())
-        if m:
-            paper_stem = m.group(1).strip()
-            if (paper_stem + ".md") in active_filenames or paper_stem in active_filenames:
-                kept.append(sec)
-        elif sec.strip():
-            kept.append(sec)
-    return ''.join(kept)
+def _filter_dead_entries(entries: list, active_filenames: set) -> list:
+    """Remove entries for papers no longer in the active library.
+    Operates on the list of (fname, text, sort, book_title) tuples — before
+    joining — so that '## Edited Book:' headings are always tied to the entries
+    they introduce and cannot become orphans.
+    """
+    return [
+        e for e in entries
+        if (e[0] in active_filenames or e[0].replace('.md', '') in active_filenames
+            or e[0] + '.md' in active_filenames)
+    ]
+
+
+def _build_entry_blocks(sorted_entries: list) -> list:
+    """Convert sorted (fname, (text, sort, book_title)) pairs into final block strings.
+
+    Injects a '## Edited Book: …' heading before the first entry of each
+    edited-volume group (entries with non-empty book_title).  The heading is
+    prepended directly to the entry text so it travels with that entry — it
+    cannot become an orphan if the entry is later removed.
+    """
+    blocks = []
+    current_book = None
+    for _fname, (entry_text, _sort, book_title) in sorted_entries:
+        if book_title and book_title != current_book:
+            blocks.append(f"## Edited Book: {book_title}\n\n{entry_text}")
+            current_book = book_title
+        else:
+            blocks.append(entry_text)
+    return blocks
 
 
 def write_all_target_notes(all_entries: dict, active_filenames: set = None, vault_path: Path = None):
@@ -1007,18 +1122,35 @@ def write_all_target_notes(all_entries: dict, active_filenames: set = None, vaul
         target_path = data['path']
         name = data['name']
 
+        # Deduplicate by fname — keep the entry with the earliest sort key.
+        # Tuples are (fname, text, first_sort, book_title).
         seen_files = {}
-        for fname, entry_text, first_sort in data['entries']:
+        for fname, entry_text, first_sort, book_title in data['entries']:
             if fname not in seen_files or first_sort < seen_files[fname][1]:
-                seen_files[fname] = (entry_text, first_sort)
-        sorted_entries = sorted(seen_files.items(), key=lambda x: x[1][1] or '')
-        entry_blocks = [entry_text for _, (entry_text, _) in sorted_entries]
+                seen_files[fname] = (entry_text, first_sort, book_title)
+
+        # Sort: regular entries (empty book_title) first, then edited-volume
+        # groups sorted by book_title then by page-range sort key.
+        sorted_entries = sorted(
+            seen_files.items(),
+            key=lambda x: (x[1][2] or '', x[1][1] or '')
+        )
+
+        # Filter dead entries at tuple level so headings stay tied to their entries.
+        if active_filenames:
+            sorted_entries = [
+                (fname, vals) for fname, vals in sorted_entries
+                if _filter_dead_entries([(fname,) + vals], active_filenames)
+            ]
+
+        entry_blocks = _build_entry_blocks(sorted_entries)
         new_zotero_block = (
             CONCEPT_T_START + "\n\n" +
             '\n---\n\n'.join(entry_blocks) +
             "\n\n" + CONCEPT_T_END
         )
 
+        existing = None  # guard: ensures skip-write check below is safe
         if target_path.exists():
             existing = target_path.read_text(encoding='utf-8', errors='replace')
             if CONCEPT_T_START in existing and CONCEPT_T_END in existing:
@@ -1026,13 +1158,6 @@ def write_all_target_notes(all_entries: dict, active_filenames: set = None, vaul
                 end = existing.find(CONCEPT_T_END) + len(CONCEPT_T_END)
                 before = existing[:start].rstrip('\n')
                 after = existing[end:].strip('\n')
-                # Strip entries from papers that no longer exist in the library
-                if active_filenames:
-                    new_zotero_block = (
-                        CONCEPT_T_START + "\n\n" +
-                        _strip_dead_entries('\n---\n\n'.join(entry_blocks), active_filenames) +
-                        "\n\n" + CONCEPT_T_END
-                    )
                 parts = [p for p in [before, new_zotero_block, after] if p.strip()]
                 full_content = '\n\n'.join(parts)
             else:
@@ -1046,12 +1171,9 @@ def write_all_target_notes(all_entries: dict, active_filenames: set = None, vaul
         if len(full_content.encode('utf-8')) > 500_000:
             print(f"  ⚠️  Concept file too large, skipping: {target_path.name}")
             continue
-        # Skip write if content hasn't changed — avoids unnecessary iCloud uploads
-        if target_path.exists():
-            existing_hash = hashlib.md5(target_path.read_bytes(), usedforsecurity=False).hexdigest()
-            new_hash = hashlib.md5(full_content.encode('utf-8'), usedforsecurity=False).hexdigest()
-            if existing_hash == new_hash:
-                continue
+        # Skip write if content hasn't changed — reuse already-read content (#3)
+        if existing is not None and existing == full_content:
+            continue
         try:
             atomic_write_text(target_path, full_content)
             rel = target_path.relative_to(vault_path) if vault_path else target_path.relative_to(target_path.parent.parent)
@@ -1121,11 +1243,40 @@ def mark_synced(paper_key: str, annotations: list, snapshot: dict):
 def prune_snapshot(snapshot: dict, active_paper_keys: set):
     """Remove snapshot entries for papers no longer in the library.
     Prevents unbounded growth over years of use."""
-    for section in ('synced', 'dismissed'):
+    for section in ('synced', 'dismissed', 'concept_hash', 'concept_blocks'):
         if section in snapshot:
             stale = [k for k in snapshot[section] if k not in active_paper_keys]
             for k in stale:
                 del snapshot[section][k]
+
+
+def paper_state_hash(annotations: list, manual_links: list,
+                     paper_meta: tuple = ()) -> str:
+    """Hash the full state that drives concept/target note generation.
+    Covers annotation state, manual-link state, and paper-level metadata
+    (title, item_type, book_title, pages) so that any change affecting the
+    rendered output — including reclassification or title edits — triggers a
+    rebuild (#6).
+    """
+    ann_state = sorted(
+        (
+            a.get('ann_key', ''),
+            a.get('color', ''),
+            a.get('comment', ''),
+            a.get('highlighted_text', ''),
+            a.get('page_label', ''),      # shown as "p. X" in rendered entries
+            str(a.get('ann_type', 1)),    # sticky note vs highlight renders differently
+            str(a.get('sort_index', '')), # affects ordering in concept entries
+            a.get('att_key', ''),         # used to build Zotero deep links
+        )
+        for a in annotations
+    )
+    link_state = sorted((lt, ab or '', ut) for lt, ab, ut in manual_links)
+    combined = json.dumps(
+        {'meta': list(paper_meta), 'anns': ann_state, 'links': link_state},
+        sort_keys=True
+    )
+    return hashlib.md5(combined.encode(), usedforsecurity=False).hexdigest()
 
 
 def get_revoked_ann_ids(paper_key: str, all_synced_anns: list,
@@ -1285,10 +1436,18 @@ def cleanup_removed_papers(papers: dict, sources_path: Path, dry_run: bool = Fal
     """
     expected_files = set()
     for pid, paper in papers.items():
-        title = paper.get('title', 'Untitled')
-        subcolls = paper.get('subcollections', [])
-        filename = safe_filename(title) + ".md"
-        if subcolls:
+        item_type  = paper.get('item_type', '')
+        book_title = paper.get('book_title', '') if item_type == 'bookSection' else ''
+        title      = paper.get('title') or book_title or 'Untitled'
+        subcolls   = paper.get('subcollections', [])
+        filename   = safe_filename(title) + ".md"
+        if book_title:
+            if subcolls:
+                for sc in subcolls:
+                    expected_files.add((sources_path / safe_filename(sc) / safe_filename(book_title) / filename).resolve())
+            else:
+                expected_files.add((sources_path / safe_filename(book_title) / filename).resolve())
+        elif subcolls:
             for sc in subcolls:
                 expected_files.add((sources_path / safe_filename(sc) / filename).resolve())
         else:
@@ -1352,7 +1511,7 @@ def write_to_read_file(unread: dict, to_organize_path: Path):
         lines.append("")
         for paper in groups[group_name]:
             title = paper.get('title', 'Untitled')
-            authors = format_authors(paper.get('authors', []))
+            authors = format_creators(paper)
             pub_date = paper.get('pub_date', '')
             year = _extract_year(pub_date)
             author_year = f" — {authors}" + (f", {year}" if year else "")
@@ -1363,10 +1522,191 @@ def write_to_read_file(unread: dict, to_organize_path: Path):
 
     to_organize_path.mkdir(parents=True, exist_ok=True)
     out_path = to_organize_path / "To_Read.md"
-    tmp_path = str(out_path) + ".tmp"
-    Path(tmp_path).write_text('\n'.join(lines), encoding='utf-8')
-    os.replace(tmp_path, out_path)
+    atomic_write_text(out_path, '\n'.join(lines))
     print(f"  📋 To_Read.md updated ({total_unread} unread papers)")
+
+
+# ── Case B: multi-paper book partitioning ────────────────────────────────────
+
+def _page_label_to_int(page_label: str):
+    """Convert a plain-integer page label to int; return None for roman/alpha labels."""
+    if not page_label:
+        return None
+    try:
+        return int(page_label.strip())
+    except ValueError:
+        return None
+
+
+def _page_range_str(annotations: list) -> str:
+    """Return 'X–Y' page range string for a group of annotations."""
+    nums = [n for a in annotations
+            for n in [_page_label_to_int(a.get('page_label', ''))]
+            if n is not None]
+    if not nums:
+        return ''
+    lo, hi = min(nums), max(nums)
+    return f"{lo}–{hi}" if lo != hi else str(lo)
+
+
+def _is_case_b(paper: dict) -> bool:
+    """Return True if this item should be partitioned into multiple source files.
+
+    Triggers for:
+    - item_type == 'book' with editors and no authors — edited volumes whose
+      annotations span multiple chapters (monographs authored by a single person
+      should NOT be partitioned; they are one coherent work).
+    - item_type == 'bookSection' with no title set in Zotero — acts as a
+      whole-book container rather than a single chapter entry.
+
+    NOTE: This function cannot resolve the underlying Zotero model limitation.
+    Annotations are always attached to a single parent attachment item. True
+    per-chapter annotation scoping would require separate Zotero items (one
+    bookSection per chapter) or a Zotero plugin — this heuristic is the best
+    approximation available without modifying the Zotero database schema.
+    """
+    itype = paper.get('item_type', '')
+    if itype == 'book':
+        # Only partition edited volumes (editors present, no authors).
+        # A single-author monograph is one work and should stay as one file.
+        has_authors = bool(paper.get('authors'))
+        has_editors = bool(paper.get('editors'))
+        return has_editors and not has_authors
+    if itype == 'bookSection' and not paper.get('title'):
+        return True
+    return False
+
+
+def partition_annotations(annotations: list, gap_threshold: int = 50) -> list:
+    """Split a flat annotation list into per-paper groups.
+
+    Strategy (priority order):
+    1. [Paper: Title] sticky-note markers  → explicit named boundaries
+    2. Page-number gap > gap_threshold     → heuristic boundaries
+    3. Fallback                            → single group (no split)
+
+    Returns a list of dicts: {'title': str|None, 'annotations': list}
+    The 'title' is the marker text when markers were used, otherwise None.
+    Marker annotations themselves are excluded from all groups.
+    """
+    if not annotations:
+        return [{'title': None, 'annotations': []}]
+
+    sorted_anns = sorted(
+        annotations,
+        key=lambda a: (a.get('sort_index') or '', a.get('page_label') or '')
+    )
+
+    # ── Pass 1: explicit [Paper: Title] markers ───────────────────────────────
+    groups = []
+    current_title = None
+    current_group = []
+    found_markers = False
+
+    for ann in sorted_anns:
+        comment = (ann.get('comment') or '').strip()
+        m = _RE_PAPER_MARKER.match(comment)
+        if m:
+            found_markers = True
+            if current_group:
+                groups.append({'title': current_title, 'annotations': current_group})
+            current_title = m.group(1).strip()
+            current_group = []
+            # Marker annotation itself is not included in any group
+        else:
+            current_group.append(ann)
+
+    if current_group:
+        groups.append({'title': current_title, 'annotations': current_group})
+
+    if found_markers:
+        non_empty = [g for g in groups if g['annotations']]
+        if len(non_empty) > 1:
+            return non_empty
+
+    # ── Pass 2: page-gap heuristic ────────────────────────────────────────────
+    groups = []
+    current_group = [sorted_anns[0]]
+    prev_page = _page_label_to_int(sorted_anns[0].get('page_label', ''))
+
+    for ann in sorted_anns[1:]:
+        page = _page_label_to_int(ann.get('page_label', ''))
+        if (prev_page is not None and page is not None
+                and page - prev_page > gap_threshold):
+            groups.append({'title': None, 'annotations': current_group})
+            current_group = []
+        current_group.append(ann)
+        if page is not None:
+            prev_page = page
+
+    groups.append({'title': None, 'annotations': current_group})
+
+    non_empty = [g for g in groups if g['annotations']]
+    if len(non_empty) > 1:
+        return non_empty
+
+    # ── Fallback: keep everything together ────────────────────────────────────
+    return [{'title': None, 'annotations': sorted_anns}]
+
+
+def _expand_case_b_papers(papers: dict) -> dict:
+    """Expand Case B items into virtual per-paper entries keyed by '<key>:partN'.
+
+    Non-Case-B papers pass through unchanged.
+    Virtual papers inherit all parent fields and override:
+      title, item_type, book_title, pages, annotations, _virtual_key
+    The original key is preserved so Zotero deep links still work.
+    """
+    result = {}
+    for pid, paper in papers.items():
+        if not _is_case_b(paper):
+            result[pid] = paper
+            continue
+
+        annotations = paper.get('annotations', [])
+        if not annotations:
+            result[pid] = paper
+            continue
+
+        groups = partition_annotations(annotations)
+
+        if len(groups) == 1:
+            # Not actually spanning multiple papers — treat as normal
+            result[pid] = paper
+            continue
+
+        parent_key   = paper.get('key', str(pid))
+        # For 'book' items the book_title for virtual entries is the item's own title
+        parent_title = paper.get('title') or paper.get('book_title') or 'Untitled'
+
+        print(f"  📖 Partitioning '{parent_title}' → {len(groups)} part(s)")
+
+        for i, group in enumerate(groups):
+            group_anns   = group['annotations']
+            marker_title = group.get('title')
+
+            if marker_title:
+                virtual_title = marker_title
+            else:
+                page_range = _page_range_str(group_anns)
+                virtual_title = f"pp. {page_range}" if page_range else f"Part {i + 1}"
+
+            # Include first page in key for stability when annotation count shifts.
+            first_page = (group_anns[0].get('page_label') or '').replace(' ', '')
+            virtual_key = f"{parent_key}:p{first_page}:{i}" if first_page else f"{parent_key}:part{i}"
+            pages_for_meta    = _page_range_str(group_anns)
+
+            virtual_paper = dict(paper)  # shallow copy — inherits att_key, zot_key, etc.
+            virtual_paper['title']        = virtual_title
+            virtual_paper['item_type']    = 'bookSection'
+            virtual_paper['book_title']   = parent_title
+            virtual_paper['pages']        = pages_for_meta
+            virtual_paper['annotations']  = group_anns
+            virtual_paper['_virtual_key'] = virtual_key
+
+            result[f"{pid}:part{i}"] = virtual_paper
+
+    return result
 
 
 # ── Main run ──────────────────────────────────────────────────────────────────
@@ -1420,8 +1760,15 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
     print(f"\n📚 Reading Zotero database: {zotero_db}")
     papers, unread_papers = get_zotero_data(zotero_db)
     print(f"   Found {len(papers)} paper(s) with annotated comments.\n")
-    # Prune stale snapshot entries for papers no longer in library
-    prune_snapshot(snapshot, {p["key"] for p in papers.values() if p.get("key")})
+    # Expand Case B items (books / untitled bookSections) into virtual per-paper entries
+    papers = _expand_case_b_papers(papers)
+    # Prune stale snapshot entries for papers no longer in library.
+    # Virtual papers use _virtual_key; normal papers use key.
+    prune_snapshot(snapshot, {
+        p.get('_virtual_key') or p.get('key')
+        for p in papers.values()
+        if p.get('_virtual_key') or p.get('key')
+    })
 
     if not papers:
         print("No papers found with comments in annotations.")
@@ -1435,13 +1782,28 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
     all_entries = {}  # target_path → entries to write
 
     for pid, paper in papers.items():
-        title        = paper.get('title', 'Untitled')
-        subcolls     = paper.get('subcollections', [])
-        filename     = safe_filename(title) + ".md"
-        paper_key    = paper.get('key', str(pid))
+        item_type  = paper.get('item_type', '')
+        book_title = paper.get('book_title', '') if item_type == 'bookSection' else ''
+        # Use book_title as fallback when a bookSection has no paper title set in Zotero
+        title      = paper.get('title') or book_title or 'Untitled'
+        subcolls   = paper.get('subcollections', [])
+        filename   = safe_filename(title) + ".md"
+        # Virtual (Case B) papers use _virtual_key for snapshot tracking so that
+        # each partition has its own independent state entry.
+        paper_key  = paper.get('_virtual_key') or paper.get('key', str(pid))
+        # Non-empty only for Case B virtual papers — drives ## Edited Book: heading
+        virtual_book_title = book_title if '_virtual_key' in paper else ''
 
-        # Build list of source directories — one per collection (or root if none)
-        if subcolls:
+        # Build list of source directories.
+        # Case B virtual papers nest inside their Zotero collection folder so the
+        # hierarchy mirrors Zotero: Sources/<Collection>/<BookTitle>/<Chapter>.md
+        if book_title:
+            if subcolls:
+                source_dirs = [sources_path / safe_filename(sc) / safe_filename(book_title)
+                               for sc in subcolls]
+            else:
+                source_dirs = [sources_path / safe_filename(book_title)]
+        elif subcolls:
             source_dirs = [sources_path / safe_filename(sc) for sc in subcolls]
         else:
             source_dirs = [sources_path]
@@ -1450,7 +1812,12 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
             for sd in source_dirs:
                 sd.mkdir(parents=True, exist_ok=True)
 
-        print(f"📄 {title}" + (f" ({len(source_dirs)} collections)" if len(source_dirs) > 1 else ""))
+        label = f" [bookSection in {book_title}]" if book_title else (f" ({len(source_dirs)} collections)" if len(source_dirs) > 1 else "")
+        is_virtual = '_virtual_key' in paper
+        if is_virtual:
+            print(f"  📄 {title}{label}")
+        else:
+            print(f"📄 {title}{label}")
 
         # ── Check for color-revoked annotations (changed away from green) ─────
         all_anns       = paper.get('annotations', [])
@@ -1479,6 +1846,22 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         active_anns = all_anns  # alias — list is not modified
         paper['annotations_for_display'] = active_anns
 
+        # ── Detect whether concept/target rebuild can be skipped (#6) ─────────
+        # Hash covers both annotation state and manual-link state so that changes
+        # to either are caught. Always written so the snapshot is self-healing.
+        _current_state_hash = paper_state_hash(
+            active_anns, manual_links,
+            paper_meta=(
+                title,
+                item_type,
+                book_title,
+                paper.get('pages', '') if item_type == 'bookSection' else '',
+            )
+        )
+        _last_state_hash = snapshot.get('concept_hash', {}).get(paper_key)
+        skip_concept_rebuild = (not dry_run and _current_state_hash == _last_state_hash)
+        snapshot.setdefault('concept_hash', {})[paper_key] = _current_state_hash
+
         # ── Write Source note to ALL collection folders ───────────────────────
         if not dry_run:
             note_content = build_source_note(paper, before, after, inter_notes)
@@ -1489,9 +1872,15 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
             for sd in source_dirs:
                 sf = sd / filename
                 try:
-                    # Skip write if content unchanged — avoids iCloud uploads every 2min
+                    # Skip write if content unchanged — avoids iCloud uploads every 2min.
+                    # Reuse already-read content when possible (#2/#3).
                     if sf.exists():
-                        if hashlib.md5(sf.read_bytes(), usedforsecurity=False).hexdigest() == hashlib.md5(note_content.encode('utf-8'), usedforsecurity=False).hexdigest():
+                        existing_text = (
+                            source_content
+                            if (source_content is not None and sf == source_file_used)
+                            else sf.read_text(encoding='utf-8', errors='replace')
+                        )
+                        if existing_text == note_content:
                             continue
                     atomic_write_text(sf, note_content)
                     rel = sf.relative_to(sources_path)
@@ -1510,59 +1899,103 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
             # Mark ALL active annotations as synced
             mark_synced(paper_key, active_anns, snapshot)
 
-        # ── Collect Zotero annotation → concept entries ───────────────────────
-        concept_map = {}
-        for ann in active_anns:
-            comment = ann.get('comment', '')
-            if not comment:
-                continue
-            ann_color = (ann.get('color') or '').lower()
-            if ann_color == '#a28ae5':
-                # Purple: use parse_purple_comment to get clean headline
-                headline, _ = parse_purple_comment(comment)
-                _, concepts = parse_comment(comment)
-                # Always route purple annotations to shared Thoughts and Directions file
-                thoughts_file = vault_path / THOUGHTS_DIR
-                entry = build_concept_entry_from_zotero(filename, [(ann, headline, concepts)], paper)
-                collect_concept_entry(all_entries, thoughts_file, filename, entry, ann.get('sort_index') or '')
-            elif ann_color == '#aaaaaa':
-                # Grey: use parse_grey_comment for clean headline (strips page ref)
-                headline, _ = parse_grey_comment(comment)
-                _, concepts = parse_comment(comment)
+        # ── Collect concept/target entries ────────────────────────────────────
+        if skip_concept_rebuild:
+            # Replay cached rendered blocks so unchanged papers still contribute
+            # to concept notes — without this, their entries would disappear (#6).
+            cached_blocks = snapshot.get('concept_blocks', {}).get(paper_key, {})
+            if cached_blocks:
+                print(f"  ↩ Concept entries unchanged — loading {len(cached_blocks)} block(s) from cache")
+                for target_path_str, cached_val in cached_blocks.items():
+                    entry_text, first_sort = cached_val[0], cached_val[1]
+                    cached_bt = cached_val[2] if len(cached_val) > 2 else ''
+                    collect_concept_entry(all_entries, Path(target_path_str), filename, entry_text, first_sort, cached_bt)
             else:
-                headline, concepts = parse_comment(comment)
-            for concept in concepts:
-                concept_map.setdefault(concept, [])
-                concept_map[concept].append((ann, headline, concepts))
+                skip_concept_rebuild = False   # no cache yet — fall through to rebuild
 
-        for concept_name, anns in concept_map.items():
-            if dry_run:
-                print(f"  [dry-run] Would update concept: {concept_name}")
-                continue
-            concept_file = resolve_link(concept_name.strip(), vault_index, vault_path, to_organize_path)
-            entry = build_concept_entry_from_zotero(filename, anns, paper, current_concept=concept_name)
-            first_sort = min((a[0].get('sort_index') or '' for a in anns), default='')
-            collect_concept_entry(all_entries, concept_file, filename, entry, first_sort)
-            vault_index[_norm_key(concept_name)] = concept_file
+        if not skip_concept_rebuild:
+            # Collect into a per-paper temp dict so we can cache final merged blocks.
+            paper_entries = {}
+            concept_map = {}
+            for ann in active_anns:
+                comment = ann.get('comment', '')
+                if not comment:
+                    continue
+                ann_color = (ann.get('color') or '').lower()
+                if ann_color == '#a28ae5':
+                    # Purple: use parse_purple_comment to get clean headline
+                    headline, _ = parse_purple_comment(comment)
+                    _, concepts = parse_comment(comment)
+                    # Always route purple annotations to shared Thoughts and Directions file
+                    thoughts_file = vault_path / THOUGHTS_DIR
+                    entry = build_concept_entry_from_zotero(filename, [(ann, headline, concepts)], paper)
+                    collect_concept_entry(paper_entries, thoughts_file, filename, entry, ann.get('sort_index') or '', virtual_book_title)
+                elif ann_color == '#aaaaaa':
+                    # Grey: use parse_grey_comment for clean headline (strips page ref)
+                    headline, _ = parse_grey_comment(comment)
+                    _, concepts = parse_comment(comment)
+                else:
+                    headline, concepts = parse_comment(comment)
+                for concept in concepts:
+                    concept_map.setdefault(concept, [])
+                    concept_map[concept].append((ann, headline, concepts))
 
-        # ── Collect manual [[links]] → target entries ─────────────────────────
-        manual_by_target = {}
-        for link_target, ann_block, user_text in manual_links:
-            manual_by_target.setdefault(link_target, []).append((ann_block, user_text))
+            for concept_name, anns in concept_map.items():
+                if dry_run:
+                    print(f"  [dry-run] Would update concept: {concept_name}")
+                    continue
+                concept_file = resolve_link(concept_name.strip(), vault_index, vault_path, to_organize_path)
+                entry = build_concept_entry_from_zotero(filename, anns, paper, current_concept=concept_name)
+                first_sort = min((a[0].get('sort_index') or '' for a in anns), default='')
+                collect_concept_entry(paper_entries, concept_file, filename, entry, first_sort, virtual_book_title)
+                vault_index[_norm_key(concept_name)] = concept_file
 
-        for link_target, contexts in manual_by_target.items():
-            if dry_run:
-                print(f"  [dry-run] Would send manual link to: {link_target}")
-                continue
-            target_file = resolve_link(link_target, vault_index, vault_path, to_organize_path)
-            entry = build_concept_entry_from_manual(filename, contexts)
-            collect_concept_entry(all_entries, target_file, filename, entry, '')
-            vault_index[_norm_key(link_target)] = target_file
+            # ── Collect manual [[links]] → target entries ─────────────────────
+            manual_by_target = {}
+            for link_target, ann_block, user_text in manual_links:
+                manual_by_target.setdefault(link_target, []).append((ann_block, user_text))
+
+            for link_target, contexts in manual_by_target.items():
+                if dry_run:
+                    print(f"  [dry-run] Would send manual link to: {link_target}")
+                    continue
+                target_file = resolve_link(link_target, vault_index, vault_path, to_organize_path)
+                entry = build_concept_entry_from_manual(filename, contexts)
+                collect_concept_entry(paper_entries, target_file, filename, entry, '', virtual_book_title)
+                vault_index[_norm_key(link_target)] = target_file
+
+            # Transfer per-paper entries into global all_entries and cache them.
+            # collect_concept_entry() merges by paper_filename, so each target_path
+            # has exactly one entry per paper in paper_entries.
+            # Assert this invariant explicitly so a violation raises immediately
+            # rather than silently dropping or overwriting data.
+            paper_cache = {}
+            for tkey, tdata in paper_entries.items():
+                entries = tdata['entries']
+                if len(entries) != 1:
+                    raise RuntimeError(
+                        f"Expected exactly 1 entry per paper in paper_entries for {tkey}, "
+                        f"got {len(entries)}. Bug in collect_concept_entry()."
+                    )
+                fname, entry_text, first_sort, e_book_title = entries[0]
+                collect_concept_entry(all_entries, tdata['path'], fname, entry_text, first_sort, e_book_title)
+                paper_cache[tkey] = (entry_text, first_sort, e_book_title)
+            if not dry_run:
+                snapshot.setdefault('concept_blocks', {})[paper_key] = paper_cache
 
     # ── Write all target notes ────────────────────────────────────────────────
     if not dry_run and all_entries:
         print(f"\n📝 Writing concept/target notes...")
-        active_filenames = {safe_filename(p.get('title', 'Untitled')) + ".md" for p in papers.values()}
+        # Must use the exact same title fallback as the write loop so that
+        # concept-note cleanup cannot remove live entries due to filename mismatch.
+        active_filenames = {
+            safe_filename(
+                p.get('title') or
+                (p.get('book_title', '') if p.get('item_type') == 'bookSection' else '') or
+                'Untitled'
+            ) + ".md"
+            for p in papers.values()
+        }
         write_all_target_notes(all_entries, active_filenames, vault_path)
         # Clean up To_Organize files that now have a proper home in Concepts etc.
         # Reuse already-built vault_index — no need to rebuild
