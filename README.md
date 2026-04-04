@@ -76,3 +76,30 @@ python3 Z_O_Integration_User.py --dry-run
 python3 Z_O_Integration_User.py
 ```
 Tip: Create a desktop shortcut, Raycast/Alfred command, or set up auto-sync every few minutes while reading so everything appears in Obsidian almost instantly after you finish annotating.
+Here's a suggested additions section to append to the README:
+
+---
+
+## Recent Improvements (04.26)
+
+### Annotation rendering
+- **Grey annotations** now show two separate page references: the Zotero source page in the standard meta line, and your manually added `(p. X)` citation reference (where you used it in your own writing) at the bottom of the collapsible callout.
+
+
+### Edited volumes and book support
+Two workflows are supported for books annotated as a single Zotero item:
+
+**Case A — Separate Zotero items per chapter** (recommended): Each chapter is its own `bookSection` entry in Zotero with its own title. The script automatically shows "In: *BookTitle*, pp. X–Y" context in the source note, labels editors correctly, and nests the file under `Sources/<Collection>/<BookTitle>/`.
+
+**Case B — Single Zotero item for the whole book**: The script partitions your annotations into per-chapter virtual files automatically. Two ways to define chapter boundaries:
+- **Explicit**: Add a sticky note with `[paper: Your Chapter Title Here]` at the first annotation of each chapter — this becomes both the file title and the chapter boundary marker
+- **Automatic**: If no markers are present, the script detects chapter boundaries by page gaps and names files `pp. X–Y`
+In both cases, chapter files are nested under `Sources/<Collection>/<BookTitle>/` and editors are displayed with the correct `(eds.)` label.
+
+
+
+### Link resolution
+- **Fuzzy matching**: A single-character typo in a `[[link]]` (wrong letter, missing space, transposed characters) automatically resolves to the correct file — as long as only one vault note is a close match. Digit differences are excluded so `[[chap. 1]]` never fuzzy-matches to `[[chap. 2]]`
+- **Links anywhere in file**: `[[links]]` written before the first annotation block (e.g. in the YAML header or title area) are now captured and routed correctly, not silently ignored
+
+#### +General Improvments in Performance, Safety and robustness
