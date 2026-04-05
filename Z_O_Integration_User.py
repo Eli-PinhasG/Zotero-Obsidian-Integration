@@ -21,6 +21,7 @@ import hashlib
 import os
 import sys
 import argparse
+import atexit
 import tempfile
 import shutil
 from pathlib import Path
@@ -40,7 +41,45 @@ _RE_YEAR             = re.compile(r'\d{4}')
 _RE_PAGE_META        = re.compile(r'\*.*p\..*\*')
 _RE_TASK_LINE        = re.compile(r'^- \[[ x]\]\s*$')
 _RE_FIRST_MARKER     = re.compile(r'<!-- zotero-start[^>]*-->')
-_RE_PAPER_MARKER     = re.compile(r'^\[paper:\s*(.+?)\s*\]$', re.IGNORECASE)
+# Captures: group(1)=title, group(2)=authors (optional, in inner brackets)
+_RE_PAPER_MARKER     = re.compile(r'^\[paper:\s*(.+?)(?:\s*\[([^\]]+)\])?\s*\]$', re.IGNORECASE)
+_RE_BRACKET_HEADLINE = re.compile(r'^\[([^\]]+)\]')
+_RE_PAGE_REF         = re.compile(r'\((?:p|P)\.\s*(\d+)\)')
+_RE_PAGE_REF_STRIP   = re.compile(r'\((?:p|P)\.\s*\d+\)')
+_RE_WIKI_LINK        = re.compile(r'\[\[[^\]]+\]\]')
+_RE_SPACES           = re.compile(r'\s+')
+_RE_PAGE_SPLIT       = re.compile(r'[-–]')
+_RE_META_PAGE_LINE   = re.compile(r'^\*\(p\.')
+_RE_UNSAFE_CHARS     = re.compile(r'[\/*?:"<>|]')
+_RE_CONTROL_CHARS    = re.compile(r'[\x00-\x1f]')
+_RE_CREATED_DATE     = re.compile(r'^created:\s*(\S+)', re.MULTILINE)
+
+# ── File-size safety limits ───────────────────────────────────────────────────
+MAX_FILE_SCAN_BYTES    = 500_000   # skip oversized files in annotation/link scan
+MAX_SOURCE_NOTE_BYTES  = 200_000   # safety cap for source note writes
+MAX_CONCEPT_FILE_BYTES = 500_000   # safety cap for concept file writes
+
+def parse_paper_marker(comment: str):
+    """Check if a sticky note starts with [paper: Title [Author]] on its first line.
+    Returns (title, authors, body) if it's a marker, or (None, None, None) if not.
+    - title:   the chapter/paper name
+    - authors: comma-separated author names (or None)
+    - body:    any text written AFTER the marker line (preserved as a note callout)
+    Handles multiline comments where the marker is on line 1 and notes follow.
+    """
+    if not comment:
+        return None, None, None
+    lines = comment.strip().split('\n')
+    first_line = lines[0].strip()
+    m = _RE_PAPER_MARKER.match(first_line)
+    if not m:
+        return None, None, None
+    title   = m.group(1).strip()
+    authors = m.group(2).strip() if m.group(2) else None
+    body    = '\n'.join(lines[1:]).strip()
+    return title, authors, body
+
+
 def _extract_year(pub_date: str) -> str:
     """Extract 4-digit year from a date string, or return empty string."""
     if not pub_date:
@@ -64,6 +103,7 @@ def _norm_key(s: str) -> str:
 # CONFIGURATION — set your paths here
 # ─────────────────────────────────────────────
 DEFAULT_ZOTERO_DB    = str(Path.home() / "Zotero" / "zotero.sqlite")
+_PHD_VAULT           = None  # set DEFAULT_VAULT_DIR below — this is derived from it
 DEFAULT_SOURCES_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources"
 DEFAULT_CONCEPTS_DIR = ""  # kept for CLI compat — not required
 # The root of your vault — used to resolve [[Folder/Note]] links
@@ -126,7 +166,7 @@ def parse_comment(comment: str):
             if c:
                 concepts.append(c)
     remaining = _RE_LINKS.sub('', comment).strip()
-    remaining = re.sub(r'\s+', ' ', remaining).strip()
+    remaining = _RE_SPACES.sub(' ', remaining).strip()
     headline = title_case(remaining) if remaining else None
     return headline, concepts
 
@@ -141,7 +181,7 @@ def parse_purple_comment(comment: str):
     body = comment.strip()
     headline = None
     # Look for [headline] at the start
-    bracket_match = re.match(r"^\[([^\]]+)\]", body)
+    bracket_match = _RE_BRACKET_HEADLINE.match(body)
     if bracket_match:
         headline = title_case(bracket_match.group(1).strip())
         body = body[bracket_match.end():].strip()
@@ -151,26 +191,35 @@ def parse_purple_comment(comment: str):
 def parse_grey_comment(comment: str):
     """Extract (p. X) usage reference and headline from a grey annotation comment.
     Returns (headline, doc_page) where doc_page is e.g. '45' from '(p. 45)' or '(P. 45)'.
-    Headline: from [brackets] if present, otherwise the full comment text (minus page ref).
+    Headline: from [brackets] if present, otherwise the text (minus page ref and links).
+
+    Handles [[wikilinks]] correctly — a comment like '[[chap. 1]] (p. 3)' correctly
+    extracts headline='Chap. 1' and doc_page='3' without the bracket bug.
     """
     if not comment:
         return None, None
     body = comment.strip()
-    headline = None
     doc_page = None
     # Extract (p. X) or (P. X) — page in the user's own document
-    page_match = re.search(r'\((?:p|P)\.\s*(\d+)\)', body)
+    page_match = _RE_PAGE_REF.search(body)
     if page_match:
         doc_page = page_match.group(1)
-    # Extract [headline] if present
-    bracket_match = re.match(r'^\[([^\]]+)\]', body)
+    # Collect [[wikilinks]] before stripping them — used as fallback headline
+    links = _RE_LINKS.findall(body)
+    # Strip [[wikilinks]] so single-bracket [headline] matching works correctly
+    body_no_links = _RE_WIKI_LINK.sub('', body).strip()
+    body_clean = _RE_PAGE_REF_STRIP.sub('', body_no_links).strip().strip(',.')
+    # Match [headline] — single brackets only (wikilinks already stripped)
+    bracket_match = _RE_BRACKET_HEADLINE.match(body_no_links)
     if bracket_match:
         headline = title_case(bracket_match.group(1).strip())
+    elif body_clean:
+        headline = title_case(body_clean)
+    elif links:
+        # Comment consists only of wikilinks — use first link text as headline
+        headline = title_case(links[0].split('|')[0].split('#')[0].strip())
     else:
-        # Use full comment (minus page ref) as headline — preserves original green headline
-        headline_text = re.sub(r'\((?:p|P)\.\s*\d+\)', '', body).strip().strip(',.')
-        if headline_text:
-            headline = title_case(headline_text)
+        headline = None
     return headline, doc_page
 
 
@@ -187,6 +236,9 @@ def extract_manual_links(source_file: Path, content: str = None) -> list:
             return []
         content = source_file.read_text(encoding='utf-8', errors='replace')
     file_content = content
+    # Safety: skip oversized files (mirrors extract_inter_annotation_notes guard)
+    if len(file_content) > MAX_FILE_SCAN_BYTES:
+        return []
     results = []
 
     # Capture links before the first Zotero marker (YAML header, title, etc.)
@@ -266,6 +318,8 @@ def get_zotero_data(db_path: str):
     # corrupt results if the DB changes mid-read).
     tmp_db = "/tmp/zotero_readonly_copy.sqlite"
     shutil.copy2(db_path, tmp_db)
+    # Ensure cleanup on any exit path — normal, exception, or sys.exit
+    atexit.register(lambda p=tmp_db: os.unlink(p) if os.path.exists(p) else None)
     conn = sqlite3.connect(f"file:{tmp_db}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -594,7 +648,7 @@ def build_annotation_block(ann: dict, headline: str, concepts: list,
         note_headline = None
         note_body = comment
         if comment:
-            bracket_match = re.match(r'^\[([^\]]+)\]', comment.strip())
+            bracket_match = _RE_BRACKET_HEADLINE.match(comment.strip())
             if bracket_match:
                 note_headline = title_case(bracket_match.group(1).strip())
                 note_body = comment.strip()[bracket_match.end():].strip()
@@ -678,8 +732,8 @@ def extract_inter_annotation_notes(source_file: Path, content: str = None) -> di
             return {}
         content = source_file.read_text(encoding='utf-8', errors='replace')
     text = content
-    # Safety check — skip files over 500KB
-    if len(text) > 500_000:
+    # Safety check — skip files over MAX_FILE_SCAN_BYTES
+    if len(text) > MAX_FILE_SCAN_BYTES:
         print(f"  ⚠️  Skipping oversized file: {source_file.name}")
         return {}
     result = {}
@@ -702,7 +756,7 @@ def extract_inter_annotation_notes(source_file: Path, content: str = None) -> di
                 continue
             if s.startswith('<!--'):
                 continue
-            if re.match(r'\*\(p\.', s):
+            if _RE_META_PAGE_LINE.match(s):
                 continue
             if _RE_TASK_LINE.match(s):
                 continue
@@ -735,9 +789,22 @@ def build_zotero_block(paper: dict, inter_notes: dict = None) -> str:
             # Sticky note — only render if it actually has content
             if not comment:
                 continue
-            is_first = not first_sticky_seen
-            first_sticky_seen = True
-            block = build_annotation_block(ann, None, [], is_first_note=is_first)
+            # Check for [paper: Title [Author]] marker (may have body text after it)
+            _pm_title, _pm_authors, _pm_body = parse_paper_marker(comment)
+            if _pm_title is not None:
+                # It's a boundary marker — render only if it has body text after the marker line
+                if not _pm_body:
+                    continue  # pure boundary marker, no body — skip entirely
+                # Has body text: render the body as a note callout, using the paper title as headline
+                _marker_ann = dict(ann)
+                _marker_ann['comment'] = f"[{_pm_title}] {_pm_body}"
+                is_first = not first_sticky_seen
+                first_sticky_seen = True
+                block = build_annotation_block(_marker_ann, None, [], is_first_note=is_first)
+            else:
+                is_first = not first_sticky_seen
+                first_sticky_seen = True
+                block = build_annotation_block(ann, None, [], is_first_note=is_first)
         elif is_grey:
             # Grey annotation = used citation — render as collapsible "done" callout
             headline, doc_page = parse_grey_comment(comment)
@@ -771,9 +838,9 @@ def build_source_note(paper: dict, before: str, after: str,
                       inter_notes: dict = None) -> str:
     """Build the full source note, preserving manual content outside the Zotero block."""
     item_type    = paper.get('item_type', '')
-    book_title   = paper.get('book_title', '') if item_type == 'bookSection' else ''
-    pages        = paper.get('pages', '')      if item_type == 'bookSection' else ''
-    # Null-safe title: bookSections may have no paper title set in Zotero
+    book_title   = (paper.get('book_title') or '') if item_type == 'bookSection' else ''
+    pages        = (paper.get('pages') or '')      if item_type == 'bookSection' else ''
+    # Null-safe title: bookSections may have no paper title set in Zotero.
     title        = paper.get('title') or book_title or 'Untitled'
     authors_list = paper.get('authors', [])
     editors_list = paper.get('editors', [])
@@ -789,7 +856,7 @@ def build_source_note(paper: dict, before: str, after: str,
     # Preserve original creation date if the file already exists
     created_date = datetime.now().strftime("%Y-%m-%d")
     if before:
-        m = re.search(r'^created:\s*(\S+)', before, re.MULTILINE)
+        m = _RE_CREATED_DATE.search(before)
         if m:
             created_date = m.group(1)
 
@@ -819,9 +886,13 @@ def build_source_note(paper: dict, before: str, after: str,
     header_lines.append("")
 
     # ── Body ─────────────────────────────────────────────────────────────────
-    # No # Title heading — relies on Obsidian inline title (filename) to avoid
-    # visual duplication. The Zotero open link is attached to the creator line
-    # instead (for bookSection items it is already in the "In:" line below).
+    # Show explicit # Title heading when filename has a sort prefix (p. 009 ...)
+    # so Obsidian displays the clean title instead of the prefixed filename.
+    # Heading shown whenever filename has a sort prefix — i.e. any bookSection chapter.
+    _has_prefix = bool(book_title and pages and item_type == 'bookSection')
+    if _has_prefix:
+        header_lines.append(f"# {title}")
+        header_lines.append("")
     att_key_paper = paper.get('att_key', '')
     if att_key_paper:
         zotero_item_link = f"[→](zotero://open-pdf/library/items/{att_key_paper})"
@@ -896,15 +967,17 @@ def build_concept_entry_from_zotero(paper_filename: str, annotations: list,
                                      paper: dict = None, current_concept: str = None) -> str:
     """Build a concept entry: one headline per source, bullets sorted by page order."""
     lines = []
-    lines.append(f"### From [[{paper_filename.replace('.md','')}]]")
+    # Use paper title for the link — always clean (prefix is filename-only)
+    display_stem = (paper.get('title') if paper else None) or paper_filename.replace('.md', '')
+    lines.append(f"### From [[{display_stem}]]")
 
     if paper:
         authors = format_creators(paper)
         pub_date = paper.get('pub_date', '')
         year = _extract_year(pub_date)
         item_type  = paper.get('item_type', '')
-        book_title = paper.get('book_title', '') if item_type == 'bookSection' else ''
-        pages      = paper.get('pages', '')      if item_type == 'bookSection' else ''
+        book_title = (paper.get('book_title') or '') if item_type == 'bookSection' else ''
+        pages      = (paper.get('pages') or '')      if item_type == 'bookSection' else ''
         if book_title:
             # Show collection context subtly (paper is in an edited volume)
             collection_line = f"*in {book_title}"
@@ -963,7 +1036,7 @@ def build_concept_entry_from_zotero(paper_filename: str, annotations: list,
             text = (ann.get('highlighted_text') or '').strip()
             raw_comment = (ann.get('comment') or '').strip()
             _, purple_body = parse_purple_comment(raw_comment)
-            purple_body = re.sub(r'\[\[[^\]]+\]\]', '', purple_body).strip()
+            purple_body = _RE_WIKI_LINK.sub('', purple_body).strip()
             if headline:
                 lines.append(f"#### {headline}{meta_str}")
                 lines.append("")
@@ -980,11 +1053,11 @@ def build_concept_entry_from_zotero(paper_filename: str, annotations: list,
             raw_comment = (ann.get('comment') or '').strip()
             note_headline = None
             note_body = raw_comment
-            bracket_match = re.match(r'^\[([^\]]+)\]', raw_comment)
+            bracket_match = _RE_BRACKET_HEADLINE.match(raw_comment)
             if bracket_match:
                 note_headline = title_case(bracket_match.group(1).strip())
                 note_body = raw_comment[bracket_match.end():].strip()
-            note_body = re.sub(r'\[\[[^\]]+\]\]', '', note_body).strip()
+            note_body = _RE_WIKI_LINK.sub('', note_body).strip()
             if first_sticky_in_concept and not note_headline:
                 callout_title = "Overview"
             elif first_sticky_in_concept and note_headline:
@@ -1020,10 +1093,13 @@ def build_concept_entry_from_zotero(paper_filename: str, annotations: list,
     return '\n'.join(lines)
 
 
-def build_concept_entry_from_manual(paper_filename: str, contexts: list) -> str:
+def build_concept_entry_from_manual(paper_filename: str, contexts: list,
+                                    paper: dict = None) -> str:
     """Build a concept entry from manual [[links]]."""
     lines = []
-    lines.append(f"### From [[{paper_filename.replace('.md','')}]]")
+    # Use paper title for the link — always clean (prefix is filename-only)
+    display_stem = (paper.get('title') if paper else None) or paper_filename.replace('.md', '')
+    lines.append(f"### From [[{display_stem}]]")
     lines.append("")
     seen = set()
     for ann_block, user_text in contexts:
@@ -1031,8 +1107,8 @@ def build_concept_entry_from_manual(paper_filename: str, contexts: list) -> str:
         if key in seen:
             continue
         seen.add(key)
-        clean_ann = re.sub(r'<!-- zotero-start[^>]*-->', '', ann_block)
-        clean_ann = re.sub(r'<!-- zotero-end -->', '', clean_ann).strip()
+        clean_ann = _RE_FIRST_MARKER.sub('', ann_block)
+        clean_ann = clean_ann.replace('<!-- zotero-end -->', '').strip()
         for line in clean_ann.split('\n'):
             stripped = line.strip()
             if stripped:
@@ -1168,7 +1244,7 @@ def write_all_target_notes(all_entries: dict, active_filenames: set = None, vaul
             full_content = header + "\n" + new_zotero_block
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        if len(full_content.encode('utf-8')) > 500_000:
+        if len(full_content.encode('utf-8')) > MAX_CONCEPT_FILE_BYTES:
             print(f"  ⚠️  Concept file too large, skipping: {target_path.name}")
             continue
         # Skip write if content hasn't changed — reuse already-read content (#3)
@@ -1237,7 +1313,12 @@ def mark_synced(paper_key: str, annotations: list, snapshot: dict):
     existing = set(snapshot['synced'][paper_key])
     for ann in annotations:
         existing.add(ann_id(ann))
-    snapshot['synced'][paper_key] = list(existing)
+    ids = list(existing)
+    # Safety cap: a single paper should never accumulate more than 5000 IDs.
+    # In practice this limit is never reached; it prevents runaway growth from bugs.
+    if len(ids) > 5000:
+        ids = ids[-5000:]
+    snapshot['synced'][paper_key] = ids
 
 
 def prune_snapshot(snapshot: dict, active_paper_keys: set):
@@ -1365,7 +1446,7 @@ def resolve_link(link_target: str, vault_index: dict,
     link_target = _clean_link_target(link_target)
     # Guard against directory traversal attempts
     if '..' in link_target:
-        safe_name = re.sub(r'[\/*?:"<>|]', '', link_target).strip()
+        safe_name = _RE_UNSAFE_CHARS.sub('', link_target).strip()
         return to_organize_path / (safe_name + ".md")
     if '/' in link_target:
         resolved = vault_path / (link_target + ".md")
@@ -1373,7 +1454,7 @@ def resolve_link(link_target: str, vault_index: dict,
         try:
             resolved.relative_to(vault_path)
         except ValueError:
-            safe_name = re.sub(r'[\/*?:"<>|]', '', link_target.replace('/', '_')).strip()
+            safe_name = _RE_UNSAFE_CHARS.sub('', link_target.replace('/', '_')).strip()
             return to_organize_path / (safe_name + ".md")
         return resolved
 
@@ -1394,9 +1475,9 @@ def resolve_link(link_target: str, vault_index: dict,
     if len(matches) == 1:
         return matches[0]
 
-    safe_name = re.sub(r'[\x00-\x1f]', '', link_target)
-    safe_name = re.sub(r'[\/*?:"<>|]', '', safe_name)
-    safe_name = re.sub(r'\s+', ' ', safe_name).strip().lstrip('.')
+    safe_name = _RE_CONTROL_CHARS.sub('', link_target)
+    safe_name = _RE_UNSAFE_CHARS.sub('', safe_name)
+    safe_name = _RE_SPACES.sub(' ', safe_name).strip().lstrip('.')
     safe_name = (safe_name[:120] if safe_name else "Untitled")
     return to_organize_path / (safe_name + ".md")
 
@@ -1437,10 +1518,20 @@ def cleanup_removed_papers(papers: dict, sources_path: Path, dry_run: bool = Fal
     expected_files = set()
     for pid, paper in papers.items():
         item_type  = paper.get('item_type', '')
-        book_title = paper.get('book_title', '') if item_type == 'bookSection' else ''
+        book_title = (paper.get('book_title') or '') if item_type == 'bookSection' else ''
         title      = paper.get('title') or book_title or 'Untitled'
         subcolls   = paper.get('subcollections', [])
-        filename   = safe_filename(title) + ".md"
+        # Match the same prefix logic used in the main sync loop
+        if book_title and item_type == 'bookSection':
+            pages_field = paper.get('pages') or ''
+            first_page_str = _RE_PAGE_SPLIT.split(pages_field)[0].strip()
+            try:
+                sort_prefix = f"p. {int(first_page_str):03d} — "
+                filename = safe_filename(sort_prefix + title) + ".md"
+            except (ValueError, TypeError):
+                filename = safe_filename(title) + ".md"
+        else:
+            filename = safe_filename(title) + ".md"
         if book_title:
             if subcolls:
                 for sc in subcolls:
@@ -1538,6 +1629,8 @@ def _page_label_to_int(page_label: str):
         return None
 
 
+
+
 def _page_range_str(annotations: list) -> str:
     """Return 'X–Y' page range string for a group of annotations."""
     nums = [n for a in annotations
@@ -1567,14 +1660,41 @@ def _is_case_b(paper: dict) -> bool:
     """
     itype = paper.get('item_type', '')
     if itype == 'book':
-        # Only partition edited volumes (editors present, no authors).
-        # A single-author monograph is one work and should stay as one file.
+        # Partition if: (a) editors present and no authors (classic edited volume)
+        # OR (b) user has added explicit [paper: Title] marker stickies — they want
+        # partitioning regardless of how the book is catalogued in Zotero.
         has_authors = bool(paper.get('authors'))
         has_editors = bool(paper.get('editors'))
-        return has_editors and not has_authors
+        has_markers = any(
+            parse_paper_marker((a.get('comment') or '').strip())[0] is not None
+            for a in paper.get('annotations', [])
+            if a.get('ann_type') == 2
+        )
+        return (has_editors and not has_authors) or has_markers
     if itype == 'bookSection' and not paper.get('title'):
         return True
     return False
+
+
+def _gap_split(annotations: list, gap_threshold: int) -> list:
+    """Split a sorted annotation list into sublists wherever page gap > gap_threshold.
+    Returns a list of lists (each sublist is a group of annotations).
+    """
+    if not annotations:
+        return []
+    groups = []
+    current = [annotations[0]]
+    prev_page = _page_label_to_int(annotations[0].get('page_label', ''))
+    for ann in annotations[1:]:
+        page = _page_label_to_int(ann.get('page_label', ''))
+        if prev_page is not None and page is not None and page - prev_page > gap_threshold:
+            groups.append(current)
+            current = []
+        current.append(ann)
+        if page is not None:
+            prev_page = page
+    groups.append(current)
+    return [g for g in groups if g]
 
 
 def partition_annotations(annotations: list, gap_threshold: int = 50) -> list:
@@ -1590,7 +1710,7 @@ def partition_annotations(annotations: list, gap_threshold: int = 50) -> list:
     Marker annotations themselves are excluded from all groups.
     """
     if not annotations:
-        return [{'title': None, 'annotations': []}]
+        return [{'title': None, 'annotations': [], 'authors': None}]
 
     sorted_anns = sorted(
         annotations,
@@ -1599,54 +1719,62 @@ def partition_annotations(annotations: list, gap_threshold: int = 50) -> list:
 
     # ── Pass 1: explicit [Paper: Title] markers ───────────────────────────────
     groups = []
-    current_title = None
-    current_group = []
-    found_markers = False
+    current_title   = None
+    current_authors = None
+    current_group   = []
+    found_markers   = False
 
     for ann in sorted_anns:
         comment = (ann.get('comment') or '').strip()
-        m = _RE_PAPER_MARKER.match(comment)
-        if m:
+        _pm_title, _pm_authors, _pm_body = parse_paper_marker(comment)
+        if _pm_title is not None:
             found_markers = True
             if current_group:
-                groups.append({'title': current_title, 'annotations': current_group})
-            current_title = m.group(1).strip()
-            current_group = []
-            # Marker annotation itself is not included in any group
+                groups.append({'title': current_title, 'annotations': current_group,
+                               'authors': current_authors})
+            current_title   = _pm_title
+            current_authors = _pm_authors
+            current_group   = []
+            # Marker annotation itself excluded from all annotation groups
         else:
             current_group.append(ann)
 
     if current_group:
-        groups.append({'title': current_title, 'annotations': current_group})
+        groups.append({'title': current_title, 'annotations': current_group,
+                       'authors': current_authors})
 
     if found_markers:
-        non_empty = [g for g in groups if g['annotations']]
-        if len(non_empty) > 1:
+        # Markers take priority — but a single marker may cover multiple chapters.
+        # Sub-split each marker group by page gaps so that:
+        #   - The first sub-group gets the marker title
+        #   - Subsequent sub-groups within the same marker get pp.X-Y names
+        result_groups = []
+        for g in groups:
+            if not g['annotations']:
+                continue
+            sub = _gap_split(g['annotations'], gap_threshold)
+            if len(sub) == 1:
+                result_groups.append({'title': g['title'], 'annotations': sub[0],
+                                      'authors': g['authors']})
+            else:
+                # First sub-group inherits marker title; rest are unnamed
+                for j, sub_anns in enumerate(sub):
+                    result_groups.append({
+                        'title':   g['title'] if j == 0 else None,
+                        'annotations': sub_anns,
+                        'authors': g['authors'] if j == 0 else None,
+                    })
+        non_empty = [g for g in result_groups if g['annotations']]
+        if non_empty:
             return non_empty
 
-    # ── Pass 2: page-gap heuristic ────────────────────────────────────────────
-    groups = []
-    current_group = [sorted_anns[0]]
-    prev_page = _page_label_to_int(sorted_anns[0].get('page_label', ''))
-
-    for ann in sorted_anns[1:]:
-        page = _page_label_to_int(ann.get('page_label', ''))
-        if (prev_page is not None and page is not None
-                and page - prev_page > gap_threshold):
-            groups.append({'title': None, 'annotations': current_group})
-            current_group = []
-        current_group.append(ann)
-        if page is not None:
-            prev_page = page
-
-    groups.append({'title': None, 'annotations': current_group})
-
-    non_empty = [g for g in groups if g['annotations']]
+    # ── Pass 2: page-gap heuristic (no markers found) ────────────────────────
+    non_empty = [g for g in _gap_split(sorted_anns, gap_threshold) if g]
     if len(non_empty) > 1:
-        return non_empty
+        return [{'title': None, 'annotations': a, 'authors': None} for a in non_empty]
 
     # ── Fallback: keep everything together ────────────────────────────────────
-    return [{'title': None, 'annotations': sorted_anns}]
+    return [{'title': None, 'annotations': sorted_anns, 'authors': None}]
 
 
 def _expand_case_b_papers(papers: dict) -> dict:
@@ -1670,10 +1798,12 @@ def _expand_case_b_papers(papers: dict) -> dict:
 
         groups = partition_annotations(annotations)
 
-        if len(groups) == 1:
-            # Not actually spanning multiple papers — treat as normal
+        if len(groups) == 1 and not groups[0].get('title'):
+            # Single group with no marker title — treat as normal single-file paper
             result[pid] = paper
             continue
+        # Single group WITH a marker title: still create a virtual paper so it
+        # gets nested correctly under Sources/<Collection>/<BookTitle>/<ChapterTitle>.md
 
         parent_key   = paper.get('key', str(pid))
         # For 'book' items the book_title for virtual entries is the item's own title
@@ -1685,6 +1815,7 @@ def _expand_case_b_papers(papers: dict) -> dict:
             group_anns   = group['annotations']
             marker_title = group.get('title')
 
+            marker_authors = group.get('authors')  # from [paper: Title [Author]]
             if marker_title:
                 virtual_title = marker_title
             else:
@@ -1697,12 +1828,17 @@ def _expand_case_b_papers(papers: dict) -> dict:
             pages_for_meta    = _page_range_str(group_anns)
 
             virtual_paper = dict(paper)  # shallow copy — inherits att_key, zot_key, etc.
-            virtual_paper['title']        = virtual_title
-            virtual_paper['item_type']    = 'bookSection'
-            virtual_paper['book_title']   = parent_title
-            virtual_paper['pages']        = pages_for_meta
-            virtual_paper['annotations']  = group_anns
-            virtual_paper['_virtual_key'] = virtual_key
+            virtual_paper['title']           = virtual_title  # clean title — prefix added in _run
+            virtual_paper['item_type']       = 'bookSection'
+            virtual_paper['book_title']      = parent_title
+            virtual_paper['pages']           = pages_for_meta
+            virtual_paper['annotations']     = group_anns
+            virtual_paper['_virtual_key']    = virtual_key
+            # Author from [paper: Title [Author]] marker overrides inherited authors
+            if marker_authors:
+                # Parse comma-separated names into a list
+                virtual_paper['authors'] = [n.strip() for n in marker_authors.split(',') if n.strip()]
+                virtual_paper['editors'] = []  # clear editors — this entry has known authors
 
             result[f"{pid}:part{i}"] = virtual_paper
 
@@ -1721,6 +1857,11 @@ def run(zotero_db: str, sources_dir: str, concepts_dir: str,
     if lock_file.exists():
         try:
             pid = int(lock_file.read_text(encoding='utf-8', errors='replace').strip())
+            # Treat locks older than 2 hours as stale even if the PID still exists
+            # (handles processes that crashed after writing the lock but before the finally)
+            lock_age_s = datetime.now().timestamp() - lock_file.stat().st_mtime
+            if lock_age_s > 7200:
+                raise ProcessLookupError("Lock is stale (> 2 hours old)")
             os.kill(pid, 0)  # Signal 0 = just check if process exists
             print("⚠️  Another sync is already running. Skipping.")
             return
@@ -1786,8 +1927,18 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         book_title = paper.get('book_title', '') if item_type == 'bookSection' else ''
         # Use book_title as fallback when a bookSection has no paper title set in Zotero
         title      = paper.get('title') or book_title or 'Untitled'
+        # For all bookSection chapters (Case A and Case B), prefix filename with
+        # zero-padded first page so Obsidian sorts chapters in reading order.
+        if book_title and item_type == 'bookSection':
+            pages_field = paper.get('pages') or ''
+            first_page_str = _RE_PAGE_SPLIT.split(pages_field)[0].strip()
+            try:
+                filename = safe_filename(f"p. {int(first_page_str):03d} — {title}") + ".md"
+            except (ValueError, TypeError):
+                filename = safe_filename(title) + ".md"
+        else:
+            filename = safe_filename(title) + ".md"
         subcolls   = paper.get('subcollections', [])
-        filename   = safe_filename(title) + ".md"
         # Virtual (Case B) papers use _virtual_key for snapshot tracking so that
         # each partition has its own independent state entry.
         paper_key  = paper.get('_virtual_key') or paper.get('key', str(pid))
@@ -1865,8 +2016,8 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         # ── Write Source note to ALL collection folders ───────────────────────
         if not dry_run:
             note_content = build_source_note(paper, before, after, inter_notes)
-            # Safety check — never write more than 200KB to a source file
-            if len(note_content.encode('utf-8')) > 200_000:
+            # Safety check — never write more than MAX_SOURCE_NOTE_BYTES to a source file
+            if len(note_content.encode('utf-8')) > MAX_SOURCE_NOTE_BYTES:
                 print(f"  ⚠️  Content too large, skipping write for safety: {filename}")
                 continue
             for sd in source_dirs:
@@ -1905,11 +2056,21 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
             # to concept notes — without this, their entries would disappear (#6).
             cached_blocks = snapshot.get('concept_blocks', {}).get(paper_key, {})
             if cached_blocks:
-                print(f"  ↩ Concept entries unchanged — loading {len(cached_blocks)} block(s) from cache")
-                for target_path_str, cached_val in cached_blocks.items():
-                    entry_text, first_sort = cached_val[0], cached_val[1]
-                    cached_bt = cached_val[2] if len(cached_val) > 2 else ''
-                    collect_concept_entry(all_entries, Path(target_path_str), filename, entry_text, first_sort, cached_bt)
+                # Validate all cached paths before using any: if a concept file was moved
+                # in the vault the vault_index will point to its new location — using the
+                # stale cached path would create a duplicate entry at the old location.
+                cache_valid = all(
+                    vault_index.get(_norm_key(Path(tp).stem)) in (None, Path(tp))
+                    for tp in cached_blocks
+                )
+                if cache_valid:
+                    print(f"  ↩ Concept entries unchanged — loading {len(cached_blocks)} block(s) from cache")
+                    for target_path_str, cached_val in cached_blocks.items():
+                        entry_text, first_sort = cached_val[0], cached_val[1]
+                        cached_bt = cached_val[2] if len(cached_val) > 2 else ''
+                        collect_concept_entry(all_entries, Path(target_path_str), filename, entry_text, first_sort, cached_bt)
+                else:
+                    skip_concept_rebuild = False   # cached path moved — rebuild
             else:
                 skip_concept_rebuild = False   # no cache yet — fall through to rebuild
 
@@ -1960,7 +2121,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
                     print(f"  [dry-run] Would send manual link to: {link_target}")
                     continue
                 target_file = resolve_link(link_target, vault_index, vault_path, to_organize_path)
-                entry = build_concept_entry_from_manual(filename, contexts)
+                entry = build_concept_entry_from_manual(filename, contexts, paper)
                 collect_concept_entry(paper_entries, target_file, filename, entry, '', virtual_book_title)
                 vault_index[_norm_key(link_target)] = target_file
 
@@ -1988,14 +2149,22 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         print(f"\n📝 Writing concept/target notes...")
         # Must use the exact same title fallback as the write loop so that
         # concept-note cleanup cannot remove live entries due to filename mismatch.
-        active_filenames = {
-            safe_filename(
-                p.get('title') or
-                (p.get('book_title', '') if p.get('item_type') == 'bookSection' else '') or
-                'Untitled'
-            ) + ".md"
-            for p in papers.values()
-        }
+        active_filenames = set()
+        for _p in papers.values():
+            _itype = _p.get('item_type', '')
+            _bt    = _p.get('book_title', '') if _itype == 'bookSection' else ''
+            _title = _p.get('title') or _bt or 'Untitled'
+            # Apply same prefix logic as the write loop so _filter_dead_entries matches
+            if _bt and _itype == 'bookSection':
+                _pages_field = _p.get('pages') or ''
+                _fps = _RE_PAGE_SPLIT.split(_pages_field)[0].strip()
+                try:
+                    _pfx = f"p. {int(_fps):03d} — "
+                    active_filenames.add(safe_filename(_pfx + _title) + ".md")
+                except (ValueError, TypeError):
+                    active_filenames.add(safe_filename(_title) + ".md")
+            else:
+                active_filenames.add(safe_filename(_title) + ".md")
         write_all_target_notes(all_entries, active_filenames, vault_path)
         # Clean up To_Organize files that now have a proper home in Concepts etc.
         # Reuse already-built vault_index — no need to rebuild
@@ -2009,7 +2178,19 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
     print(f"\n✅ Done! Processed {len(papers)} paper(s).")
 
 
+_LAUNCHD_LOGS = ("/tmp/zotero_sync.log", "/tmp/zotero_sync_err.log")
+
+
 def main():
+    # Truncate launchd log files so each run starts with a fresh log.
+    # launchd opens them with O_APPEND, so truncating from inside the script
+    # resets the write position — this run's output is the entire file.
+    for _log in _LAUNCHD_LOGS:
+        try:
+            os.truncate(_log, 0)
+        except OSError:
+            pass
+
     parser = argparse.ArgumentParser(
         description="Zotero → Obsidian sync with manual link support."
     )
