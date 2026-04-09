@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Z_O_Integration_User.py
-# Fill in the CONFIGURATION block below, then follow ZO_Claude_Setup_Instructions.md
+# Fill in the CONFIGURATION block below
 """
 Zotero → Obsidian Pipeline
 ---------------------------
@@ -44,8 +44,9 @@ _RE_FIRST_MARKER     = re.compile(r'<!-- zotero-start[^>]*-->')
 # Captures: group(1)=title, group(2)=authors (optional, in inner brackets)
 _RE_PAPER_MARKER     = re.compile(r'^\[paper:\s*(.+?)(?:\s*\[([^\]]+)\])?\s*\]$', re.IGNORECASE)
 _RE_BRACKET_HEADLINE = re.compile(r'^\[([^\]]+)\]')
-_RE_PAGE_REF         = re.compile(r'\((?:p|P)\.\s*(\d+)\)')
-_RE_PAGE_REF_STRIP   = re.compile(r'\((?:p|P)\.\s*\d+\)')
+# Matches: (p. 45)  (P. 45)  (pp. 45)  (p.45)  (page 45)  (Page 45)
+_RE_PAGE_REF         = re.compile(r'\((?:pp?|[Pp]age)\.?\s*(\d+)\)')
+_RE_PAGE_REF_STRIP   = re.compile(r'\((?:pp?|[Pp]age)\.?\s*\d+\)')
 _RE_WIKI_LINK        = re.compile(r'\[\[[^\]]+\]\]')
 _RE_SPACES           = re.compile(r'\s+')
 _RE_PAGE_SPLIT       = re.compile(r'[-–]')
@@ -103,16 +104,19 @@ def _norm_key(s: str) -> str:
 # CONFIGURATION — set your paths here
 # ─────────────────────────────────────────────
 DEFAULT_ZOTERO_DB    = str(Path.home() / "Zotero" / "zotero.sqlite")
-_PHD_VAULT           = None  # set DEFAULT_VAULT_DIR below — this is derived from it
-DEFAULT_SOURCES_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources"
-DEFAULT_CONCEPTS_DIR = ""  # kept for CLI compat — not required
+_PHD_VAULT           = None  # set DEFAULT_VAULT_DIR below
+_SOURCES_ROOT        = None  # derived from DEFAULT_VAULT_DIR automatically
+DEFAULT_SOURCES_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources/Subjects"
+DEFAULT_AUTHORS_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources/Authors"
+DEFAULT_CONCEPTS_DIR = ""
 # The root of your vault — used to resolve [[Folder/Note]] links
 DEFAULT_VAULT_DIR    = ""  # e.g. "/Users/yourname/.../MyVault"
 # ─────────────────────────────────────────────
 
-SNAPSHOT_FILE   = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
-TO_ORGANIZE_DIR = ""  # leave blank — derived automatically from DEFAULT_VAULT_DIR
-PHD_COLLECTION  = ""  # exact name of your root Zotero collection
+SNAPSHOT_FILE   = ""
+TO_ORGANIZE_DIR = ""
+AUTHORS_DIR     = ""
+PHD_COLLECTION  = ""
 
 # ── Auto-derived paths ────────────────────────────────────────────────────────
 if DEFAULT_VAULT_DIR:
@@ -120,6 +124,8 @@ if DEFAULT_VAULT_DIR:
         SNAPSHOT_FILE = str(Path(DEFAULT_VAULT_DIR) / ".zotero_sync_state.json")
     if not TO_ORGANIZE_DIR:
         TO_ORGANIZE_DIR = str(Path(DEFAULT_VAULT_DIR) / "To_Organize")
+    if not AUTHORS_DIR:
+        AUTHORS_DIR = str(Path(DEFAULT_VAULT_DIR) / "Sources" / "Authors")
 # ─────────────────────────────────────────────
 
 ZOTERO_START    = "<!-- zotero-start -->"
@@ -544,6 +550,15 @@ def get_zotero_data(db_path: str):
             # Only truly unread if no annotations of any color
             unread[pid] = paper
 
+    # Papers with ONLY sticky-note annotations (no highlights) are "started"
+    # — they have an overview note but no real annotations yet.
+    # Keep them in result (source file written) but also list in unread.
+    for pid, paper in result.items():
+        anns = paper.get("annotations", [])
+        if anns and all(a.get("ann_type") == 2 for a in anns):
+            paper["_overview_only"] = True
+            unread[pid] = paper
+
     if not result:
         print("\n   ⚠️  No annotations with comments found.")
         print("   Right-click a highlight in Zotero → Add Comment")
@@ -568,6 +583,21 @@ def safe_filename(title: str) -> str:
     safe = re.sub(r'[\\/*?:"<>|\'\[\]]', '', title).strip('. ')
     safe = safe.replace('\u2019', '').replace('\u2018', '')
     return safe[:120]
+
+
+def author_folder(paper: dict) -> str:
+    """Return the Authors/ subfolder name for a paper.
+    Format: "Last, First" — sorts alphabetically by surname.
+    For edited books (no authors), uses the first editor the same way.
+    """
+    people = paper.get('authors') or paper.get('editors') or []
+    if not people:
+        return "Unknown Author"
+    name = people[0]
+    parts = name.strip().split()
+    if len(parts) >= 2:
+        return safe_filename(f"{parts[-1]}, {chr(32).join(parts[:-1])}")
+    return safe_filename(name) if name else "Unknown Author"
 
 
 def format_authors(authors: list) -> str:
@@ -924,8 +954,11 @@ def build_source_note(paper: dict, before: str, after: str,
     # For bookSection: show collection context + page range with link to book
     if book_title:
         if att_key_paper and pages:
-            start_page = pages.split('–')[0].split('-')[0].strip()
-            book_link = f"[→](zotero://open-pdf/library/items/{att_key_paper}?page={start_page})"
+            _sp = pages.split('–')[0].split('-')[0].strip()
+            if _sp.isdigit():
+                book_link = f"[→](zotero://open-pdf/library/items/{att_key_paper}?page={_sp})"
+            else:
+                book_link = f"[→](zotero://open-pdf/library/items/{att_key_paper})"
         elif att_key_paper:
             book_link = f"[→](zotero://open-pdf/library/items/{att_key_paper})"
         elif zot_key:
@@ -967,9 +1000,14 @@ def build_concept_entry_from_zotero(paper_filename: str, annotations: list,
                                      paper: dict = None, current_concept: str = None) -> str:
     """Build a concept entry: one headline per source, bullets sorted by page order."""
     lines = []
-    # Use paper title for the link — always clean (prefix is filename-only)
-    display_stem = (paper.get('title') if paper else None) or paper_filename.replace('.md', '')
-    lines.append(f"### From [[{display_stem}]]")
+    file_stem    = paper_filename.replace('.md', '')
+    display_stem = (paper.get('title') if paper else None) or file_stem
+    # Use a piped wikilink when the filename has a page prefix (e.g. "p. 105 — Title")
+    # so Obsidian resolves to the actual file, not an empty root-level stub.
+    if file_stem != display_stem:
+        lines.append(f"### From [[{file_stem}|{display_stem}]]")
+    else:
+        lines.append(f"### From [[{display_stem}]]")
 
     if paper:
         authors = format_creators(paper)
@@ -1097,9 +1135,12 @@ def build_concept_entry_from_manual(paper_filename: str, contexts: list,
                                     paper: dict = None) -> str:
     """Build a concept entry from manual [[links]]."""
     lines = []
-    # Use paper title for the link — always clean (prefix is filename-only)
-    display_stem = (paper.get('title') if paper else None) or paper_filename.replace('.md', '')
-    lines.append(f"### From [[{display_stem}]]")
+    file_stem    = paper_filename.replace('.md', '')
+    display_stem = (paper.get('title') if paper else None) or file_stem
+    if file_stem != display_stem:
+        lines.append(f"### From [[{file_stem}|{display_stem}]]")
+    else:
+        lines.append(f"### From [[{display_stem}]]")
     lines.append("")
     seen = set()
     for ann_block, user_text in contexts:
@@ -1392,13 +1433,21 @@ def build_vault_index(vault_path: Path, sources_dir: str = None) -> dict:
     map of note names to file paths.
     """
     index = {}
-    sources_name = Path(sources_dir or DEFAULT_SOURCES_DIR).name.lower()
+    # Exclude the Sources/ parent (which contains Subjects/ and Authors/) from
+    # the vault concept index — source notes are not concept targets.
+    _sources_root_name = Path(sources_dir or DEFAULT_SOURCES_DIR).parent.name.lower()
+    _excluded = {_sources_root_name}
     for item in vault_path.iterdir():
-        if item.is_dir() and item.name.lower() != sources_name and not item.name.startswith('.'):
+        if item.is_dir() and item.name.lower() not in _excluded and not item.name.startswith('.'):
             for md_file in sorted(item.rglob("*.md")):
                 key = _norm_key(md_file.stem)
                 if key in index:
-                    print(f"  ⚠️  Duplicate note name '{md_file.stem}': {index[key].parent.name}/ and {md_file.parent.name}/ — [[{md_file.stem}]] links will resolve to the first one found")
+                    try:
+                        _p1 = index[key].relative_to(vault_path)
+                        _p2 = md_file.relative_to(vault_path)
+                    except ValueError:
+                        _p1, _p2 = index[key], md_file
+                    print(f"  ⚠️  Duplicate note '{md_file.stem}': {_p1} vs {_p2} — links resolve to first")
                 else:
                     index[key] = md_file
         elif item.is_file() and item.suffix == '.md':
@@ -1510,7 +1559,8 @@ def cleanup_stale_to_organize(vault_path: Path, to_organize_path: Path, vault_in
         print(f"  Cleaned {removed} stale To_Organize file(s).")
 
 
-def cleanup_removed_papers(papers: dict, sources_path: Path, dry_run: bool = False):
+def cleanup_removed_papers(papers: dict, sources_path: Path,
+                           authors_path: Path = None, dry_run: bool = False):
     """
     Remove Source files for papers that no longer exist in Zotero
     or have been moved out of the PHD Dissertation collection.
@@ -1543,32 +1593,42 @@ def cleanup_removed_papers(papers: dict, sources_path: Path, dry_run: bool = Fal
                 expected_files.add((sources_path / safe_filename(sc) / filename).resolve())
         else:
             expected_files.add((sources_path / filename).resolve())
-
-    removed = 0
-    for md_file in sources_path.rglob("*.md"):
-        if md_file.resolve() not in expected_files:
-            if dry_run:
-                print(f"  [dry-run] Would remove: {md_file.name}")
+        if authors_path:
+            _af = author_folder(paper)
+            if book_title:
+                expected_files.add((authors_path / _af / safe_filename(book_title) / filename).resolve())
             else:
-                file_text = md_file.read_text(encoding="utf-8", errors="replace")
-                # Only delete files we can prove were created by this script
-                if "zotero_sync_managed: true" not in file_text:
-                    continue
-                after_content = ""
-                if ZOTERO_END in file_text:
-                    end_pos = file_text.rfind(ZOTERO_END) + len(ZOTERO_END)
-                    after_content = file_text[end_pos:].strip()
-                if after_content:
-                    print(f"  ⚠️  Kept (has manual notes): {md_file.name}")
-                else:
-                    md_file.unlink()
-                    print(f"  🗑️  Removed: {md_file.name}")
-                    removed += 1
+                expected_files.add((authors_path / _af / filename).resolve())
 
-    # Remove empty subdirectories
-    for subdir in sorted(sources_path.rglob("*"), reverse=True):
-        if subdir.is_dir() and not any(subdir.iterdir()):
-            subdir.rmdir()
+    _scan_roots = [sources_path]
+    if authors_path and authors_path.exists():
+        _scan_roots.append(authors_path)
+    removed = 0
+    for _root in _scan_roots:
+        for md_file in _root.rglob("*.md"):
+            if md_file.resolve() not in expected_files:
+                if dry_run:
+                    print(f"  [dry-run] Would remove: {md_file.name}")
+                else:
+                    file_text = md_file.read_text(encoding="utf-8", errors="replace")
+                    if "zotero_sync_managed: true" not in file_text:
+                        continue
+                    after_content = ""
+                    if ZOTERO_END in file_text:
+                        end_pos = file_text.rfind(ZOTERO_END) + len(ZOTERO_END)
+                        after_content = file_text[end_pos:].strip()
+                    if after_content:
+                        print(f"  ⚠️  Kept (has manual notes): {md_file.name}")
+                    else:
+                        md_file.unlink()
+                        print(f"  🗑️  Removed: {md_file.name}")
+                        removed += 1
+
+    # Remove empty subdirectories in both trees
+    for _root in _scan_roots:
+        for subdir in sorted(_root.rglob("*"), reverse=True):
+            if subdir.is_dir() and not any(subdir.iterdir()):
+                subdir.rmdir()
 
     if removed:
         print(f"  Cleaned up {removed} stale source file(s).")
@@ -1576,40 +1636,68 @@ def cleanup_removed_papers(papers: dict, sources_path: Path, dry_run: bool = Fal
 
 def write_to_read_file(unread: dict, to_organize_path: Path):
     """
-    Write To_Read.md — a simple list of unannotated papers grouped by subcollection.
-    Papers disappear from this list automatically once they gain green annotations.
+    Write To_Read.md — papers with no real annotations, grouped by subcollection.
+    Two sections:
+      "Started" — has an overview sticky note but no highlights yet
+      (ungrouped)  — truly unread, no annotations at all
     """
-    # Group by subcollection (papers with no subcollection go under "Unsorted")
-    groups = {}
-    for pid, paper in unread.items():
-        subcolls = paper.get('subcollections', [])
-        if subcolls:
-            for sc in subcolls:
-                groups.setdefault(sc, []).append(paper)
-        else:
-            groups.setdefault('Unsorted', []).append(paper)
+    # Split into overview-only vs truly unread
+    started = {pid: p for pid, p in unread.items() if p.get("_overview_only")}
+    truly_unread = {pid: p for pid, p in unread.items() if not p.get("_overview_only")}
 
-    if not groups:
+    def _group_by_subcoll(papers):
+        groups = {}
+        for pid, paper in papers.items():
+            subcolls = paper.get('subcollections', [])
+            if subcolls:
+                for sc in subcolls:
+                    groups.setdefault(sc, []).append(paper)
+            else:
+                groups.setdefault('Unsorted', []).append(paper)
+        return groups
+
+    started_groups = _group_by_subcoll(started)
+    unread_groups  = _group_by_subcoll(truly_unread)
+
+    if not started_groups and not unread_groups:
         return
 
-    total_unread = sum(len(v) for v in groups.values())
-    lines = ["# To Read", ""]
-    lines.append(f"*{total_unread} papers — updated {datetime.now().strftime('%Y-%m-%d')}*")
-    lines.append("")
+    def _paper_line(paper):
+        title = paper.get('title', 'Untitled')
+        authors = format_creators(paper)
+        pub_date = paper.get('pub_date', '')
+        year = _extract_year(pub_date)
+        author_year = f" — {authors}" + (f", {year}" if year else "")
+        zot_key = paper.get('key', '')
+        zot_link = f" [↗](zotero://select/library/items/{zot_key})" if zot_key else ""
+        return f"- {title}{author_year}{zot_link}"
 
-    for group_name in sorted(groups.keys()):
-        lines.append(f"## {group_name}")
+    total_unread = len(truly_unread) + len(started)
+    now_str = datetime.now().strftime('%Y-%m-%d')
+    lines = ["# To Read", "",
+             f"*{len(truly_unread)} unread · {len(started)} started — updated {now_str}*",
+             ""]
+
+    if started_groups:
+        lines.append("## 📖 Started (overview note only)")
         lines.append("")
-        for paper in groups[group_name]:
-            title = paper.get('title', 'Untitled')
-            authors = format_creators(paper)
-            pub_date = paper.get('pub_date', '')
-            year = _extract_year(pub_date)
-            author_year = f" — {authors}" + (f", {year}" if year else "")
-            zot_key = paper.get('key', '')
-            zot_link = f" [↗](zotero://select/library/items/{zot_key})" if zot_key else ""
-            lines.append(f"- {title}{author_year}{zot_link}")
+        for group_name in sorted(started_groups.keys()):
+            if len(started_groups) > 1:
+                lines.append(f"### {group_name}")
+                lines.append("")
+            for paper in started_groups[group_name]:
+                lines.append(_paper_line(paper))
         lines.append("")
+
+    if unread_groups:
+        lines.append("## 📚 Not Yet Started")
+        lines.append("")
+        for group_name in sorted(unread_groups.keys()):
+            lines.append(f"### {group_name}")
+            lines.append("")
+            for paper in unread_groups[group_name]:
+                lines.append(_paper_line(paper))
+            lines.append("")
 
     to_organize_path.mkdir(parents=True, exist_ok=True)
     out_path = to_organize_path / "To_Read.md"
@@ -1627,8 +1715,6 @@ def _page_label_to_int(page_label: str):
         return int(page_label.strip())
     except ValueError:
         return None
-
-
 
 
 def _page_range_str(annotations: list) -> str:
@@ -1854,22 +1940,31 @@ def run(zotero_db: str, sources_dir: str, concepts_dir: str,
         vault_dir: str, dry_run: bool = False):
     # ── Prevent multiple instances running simultaneously ─────────────────────
     lock_file = Path(LOCK_FILE)
-    if lock_file.exists():
+    # Atomic lock: O_CREAT|O_EXCL creates the file only if it does not exist,
+    # eliminating the exists()+write() race condition.
+    try:
+        fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
         try:
             pid = int(lock_file.read_text(encoding='utf-8', errors='replace').strip())
-            # Treat locks older than 2 hours as stale even if the PID still exists
-            # (handles processes that crashed after writing the lock but before the finally)
             lock_age_s = datetime.now().timestamp() - lock_file.stat().st_mtime
             if lock_age_s > 7200:
                 raise ProcessLookupError("Lock is stale (> 2 hours old)")
-            os.kill(pid, 0)  # Signal 0 = just check if process exists
+            os.kill(pid, 0)
             print("⚠️  Another sync is already running. Skipping.")
             return
-        except FileNotFoundError:
-            pass  # lock file disappeared between exists() and read — harmless
-        except (ProcessLookupError, ValueError, OSError):
-            lock_file.unlink(missing_ok=True)  # Stale lock — remove it
-    lock_file.write_text(str(os.getpid()))
+        except (FileNotFoundError, ProcessLookupError, ValueError, OSError):
+            lock_file.unlink(missing_ok=True)
+            # Retry once
+            try:
+                fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+            except FileExistsError:
+                print("⚠️  Another sync is already running. Skipping.")
+                return
     try:
         _run(zotero_db, sources_dir, concepts_dir, vault_dir, dry_run)
     finally:
@@ -1880,6 +1975,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
          vault_dir: str, dry_run: bool = False):
 
     sources_path     = Path(sources_dir)
+    authors_path     = Path(AUTHORS_DIR)
     vault_path       = Path(vault_dir)
     to_organize_path = Path(TO_ORGANIZE_DIR)
 
@@ -1890,6 +1986,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
 
     if not dry_run:
         sources_path.mkdir(parents=True, exist_ok=True)
+        authors_path.mkdir(parents=True, exist_ok=True)
         to_organize_path.mkdir(parents=True, exist_ok=True)
 
     # Build vault index for case-insensitive link resolution
@@ -1917,14 +2014,14 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
 
     # ── Clean up source files for papers removed from Zotero/PHD collection ──
     if not dry_run:
-        cleanup_removed_papers(papers, sources_path, dry_run)
+        cleanup_removed_papers(papers, sources_path, authors_path, dry_run)
         write_to_read_file(unread_papers, to_organize_path)
 
     all_entries = {}  # target_path → entries to write
 
     for pid, paper in papers.items():
         item_type  = paper.get('item_type', '')
-        book_title = paper.get('book_title', '') if item_type == 'bookSection' else ''
+        book_title = (paper.get('book_title') or '') if item_type == 'bookSection' else ''
         # Use book_title as fallback when a bookSection has no paper title set in Zotero
         title      = paper.get('title') or book_title or 'Untitled'
         # For all bookSection chapters (Case A and Case B), prefix filename with
@@ -1945,9 +2042,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         # Non-empty only for Case B virtual papers — drives ## Edited Book: heading
         virtual_book_title = book_title if '_virtual_key' in paper else ''
 
-        # Build list of source directories.
-        # Case B virtual papers nest inside their Zotero collection folder so the
-        # hierarchy mirrors Zotero: Sources/<Collection>/<BookTitle>/<Chapter>.md
+        # Build list of source directories (Subjects/ — Zotero collection hierarchy).
         if book_title:
             if subcolls:
                 source_dirs = [sources_path / safe_filename(sc) / safe_filename(book_title)
@@ -1959,8 +2054,16 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         else:
             source_dirs = [sources_path]
 
+        # Authors/ directory: Authors/<Last, First>/ or Authors/<Last, First>/<BookTitle>/
+        _afolder = author_folder(paper)
+        if book_title:
+            author_dirs = [authors_path / _afolder / safe_filename(book_title)]
+        else:
+            author_dirs = [authors_path / _afolder]
+        all_dirs = source_dirs + author_dirs
+
         if not dry_run:
-            for sd in source_dirs:
+            for sd in all_dirs:
                 sd.mkdir(parents=True, exist_ok=True)
 
         label = f" [bookSection in {book_title}]" if book_title else (f" ({len(source_dirs)} collections)" if len(source_dirs) > 1 else "")
@@ -1980,8 +2083,8 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
 
         # ── Preserve manual content — read from ALL source dirs, use first non-empty ─
         source_content = None
-        source_file_used = source_dirs[0] / filename
-        for sd in source_dirs:
+        source_file_used = all_dirs[0] / filename
+        for sd in all_dirs:
             candidate = sd / filename
             if candidate.exists():
                 content = candidate.read_text(encoding='utf-8', errors='replace')
@@ -1991,7 +2094,14 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
                     break
         before, after = extract_manual_section(source_file_used, source_content)
         inter_notes   = extract_inter_annotation_notes(source_file_used, source_content)
-        manual_links  = extract_manual_links(source_file_used, source_content)
+        # Merge manual links from all source dir copies — each may have unique manual edits.
+        manual_links = extract_manual_links(source_file_used, source_content)
+        for _sd in source_dirs:
+            _candidate = _sd / filename
+            if _candidate != source_file_used and _candidate.exists():
+                _extra = extract_manual_links(_candidate)
+                _seen = {(lt, ab, ut) for lt, ab, ut in manual_links}
+                manual_links += [x for x in _extra if x not in _seen]
 
         # ── Build active annotation list ──────────────────────────────────────
         active_anns = all_anns  # alias — list is not modified
@@ -2007,6 +2117,8 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
                 item_type,
                 book_title,
                 paper.get('pages', '') if item_type == 'bookSection' else '',
+                ','.join(paper.get('authors') or []),
+                ','.join(paper.get('editors') or []),
             )
         )
         _last_state_hash = snapshot.get('concept_hash', {}).get(paper_key)
@@ -2020,9 +2132,14 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
             if len(note_content.encode('utf-8')) > MAX_SOURCE_NOTE_BYTES:
                 print(f"  ⚠️  Content too large, skipping write for safety: {filename}")
                 continue
-            for sd in source_dirs:
+            for sd in all_dirs:
                 sf = sd / filename
                 try:
+                    _rel_s = None
+                    try: _rel_s = f"Subjects/{sf.relative_to(sources_path)}"
+                    except ValueError:
+                        try: _rel_s = f"Authors/{sf.relative_to(authors_path)}"
+                        except ValueError: _rel_s = sf.name
                     # Skip write if content unchanged — avoids iCloud uploads every 2min.
                     # Reuse already-read content when possible (#2/#3).
                     if sf.exists():
@@ -2034,8 +2151,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
                         if existing_text == note_content:
                             continue
                     atomic_write_text(sf, note_content)
-                    rel = sf.relative_to(sources_path)
-                    print(f"  [written] Sources/{rel}")
+                    print(f"  [written] {_rel_s}")
                 except OSError as e:
                     print(f"  ⚠️  Could not write {sf.name}: {e}")
         # ── Report new vs already-synced (before mark_synced so count is accurate)
@@ -2182,12 +2298,14 @@ _LAUNCHD_LOGS = ("/tmp/zotero_sync.log", "/tmp/zotero_sync_err.log")
 
 
 def main():
-    # Truncate launchd log files so each run starts with a fresh log.
-    # launchd opens them with O_APPEND, so truncating from inside the script
-    # resets the write position — this run's output is the entire file.
+    # Rotate launchd log files so each run starts fresh but the previous run
+    # is preserved as .1 for post-hoc debugging.  launchd opens them with
+    # O_APPEND, so truncating from inside the script resets the write position.
     for _log in _LAUNCHD_LOGS:
         try:
-            os.truncate(_log, 0)
+            if os.path.exists(_log) and os.path.getsize(_log) > 0:
+                shutil.copy2(_log, _log + ".1")  # copy content, keep original inode
+            os.truncate(_log, 0)                 # truncate in-place; launchd's fd stays valid
         except OSError:
             pass
 
@@ -2196,6 +2314,7 @@ def main():
     )
     parser.add_argument('--zotero-db',    default=DEFAULT_ZOTERO_DB)
     parser.add_argument('--sources-dir',  default=DEFAULT_SOURCES_DIR)
+    parser.add_argument('--authors-dir',  default=DEFAULT_AUTHORS_DIR)
     parser.add_argument('--concepts-dir', default=DEFAULT_CONCEPTS_DIR)
     parser.add_argument('--vault-dir',    default=DEFAULT_VAULT_DIR)
     parser.add_argument('--dry-run',      action='store_true')
