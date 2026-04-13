@@ -104,9 +104,9 @@ def _norm_key(s: str) -> str:
 # CONFIGURATION — set your paths here
 # ─────────────────────────────────────────────
 DEFAULT_ZOTERO_DB    = str(Path.home() / "Zotero" / "zotero.sqlite")
-_PHD_VAULT           = None  # set DEFAULT_VAULT_DIR below
-_SOURCES_ROOT        = None  # derived from DEFAULT_VAULT_DIR automatically
-DEFAULT_SOURCES_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources/Subjects"
+_PHD_VAULT           = None
+_SOURCES_ROOT        = None
+DEFAULT_SOURCES_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources"
 DEFAULT_AUTHORS_DIR  = ""  # e.g. "/Users/yourname/.../MyVault/Sources/Authors"
 DEFAULT_CONCEPTS_DIR = ""
 # The root of your vault — used to resolve [[Folder/Note]] links
@@ -1433,9 +1433,9 @@ def build_vault_index(vault_path: Path, sources_dir: str = None) -> dict:
     map of note names to file paths.
     """
     index = {}
-    # Exclude the Sources/ parent (which contains Subjects/ and Authors/) from
+    # Exclude Sources/ (which contains collection subfolders and Authors/) from
     # the vault concept index — source notes are not concept targets.
-    _sources_root_name = Path(sources_dir or DEFAULT_SOURCES_DIR).parent.name.lower()
+    _sources_root_name = Path(sources_dir or DEFAULT_SOURCES_DIR).name.lower()
     _excluded = {_sources_root_name}
     for item in vault_path.iterdir():
         if item.is_dir() and item.name.lower() not in _excluded and not item.name.startswith('.'):
@@ -1600,12 +1600,11 @@ def cleanup_removed_papers(papers: dict, sources_path: Path,
             else:
                 expected_files.add((authors_path / _af / filename).resolve())
 
-    _scan_roots = [sources_path]
-    if authors_path and authors_path.exists():
-        _scan_roots.append(authors_path)
+    # authors_path (Sources/Authors/) is inside sources_path (Sources/),
+    # so a single rglob from sources_path covers both trees.
+    _scan_roots = [sources_path]  # kept for empty-subdir cleanup below
     removed = 0
-    for _root in _scan_roots:
-        for md_file in _root.rglob("*.md"):
+    for md_file in sources_path.rglob("*.md"):
             if md_file.resolve() not in expected_files:
                 if dry_run:
                     print(f"  [dry-run] Would remove: {md_file.name}")
@@ -1624,11 +1623,10 @@ def cleanup_removed_papers(papers: dict, sources_path: Path,
                         print(f"  🗑️  Removed: {md_file.name}")
                         removed += 1
 
-    # Remove empty subdirectories in both trees
-    for _root in _scan_roots:
-        for subdir in sorted(_root.rglob("*"), reverse=True):
-            if subdir.is_dir() and not any(subdir.iterdir()):
-                subdir.rmdir()
+    # Remove empty subdirectories (single pass covers Sources/Authors/ too)
+    for subdir in sorted(sources_path.rglob("*"), reverse=True):
+        if subdir.is_dir() and not any(subdir.iterdir()):
+            subdir.rmdir()
 
     if removed:
         print(f"  Cleaned up {removed} stale source file(s).")
@@ -2042,7 +2040,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
         # Non-empty only for Case B virtual papers — drives ## Edited Book: heading
         virtual_book_title = book_title if '_virtual_key' in paper else ''
 
-        # Build list of source directories (Subjects/ — Zotero collection hierarchy).
+        # Build list of source directories (Sources/ — Zotero collection hierarchy).
         if book_title:
             if subcolls:
                 source_dirs = [sources_path / safe_filename(sc) / safe_filename(book_title)
@@ -2136,7 +2134,7 @@ def _run(zotero_db: str, sources_dir: str, concepts_dir: str,
                 sf = sd / filename
                 try:
                     _rel_s = None
-                    try: _rel_s = f"Subjects/{sf.relative_to(sources_path)}"
+                    try: _rel_s = f"Sources/{sf.relative_to(sources_path)}"
                     except ValueError:
                         try: _rel_s = f"Authors/{sf.relative_to(authors_path)}"
                         except ValueError: _rel_s = sf.name
@@ -2319,6 +2317,11 @@ def main():
     parser.add_argument('--vault-dir',    default=DEFAULT_VAULT_DIR)
     parser.add_argument('--dry-run',      action='store_true')
     args = parser.parse_args()
+
+    # Apply CLI overrides to module-level constants so _run picks them up
+    global AUTHORS_DIR
+    if args.authors_dir:
+        AUTHORS_DIR = args.authors_dir
 
     if not args.sources_dir:
         print("ERROR: Please set DEFAULT_SOURCES_DIR at the top of this script.")
